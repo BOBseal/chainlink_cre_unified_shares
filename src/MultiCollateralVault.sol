@@ -22,7 +22,7 @@ import {ReceiverTemplate} from "./Receiver.sol";
  * - All holders (original depositors & transferees) receive same ratios
  * - Ownership controls: CRE (Chainlink Runtime Environment) handles all state-changing operations
  */
-abstract contract ERC4626MultiCollateralVault is ERC20, Ownable , ReceiverTemplate {
+abstract contract MultiCollateralVault is ERC20, Ownable , ReceiverTemplate {
     using SafeERC20 for IERC20;
     using Math for uint256;
 
@@ -44,13 +44,13 @@ abstract contract ERC4626MultiCollateralVault is ERC20, Ownable , ReceiverTempla
 
     /// @dev Stores deposit batches by batch ID
     mapping(uint256 => DepositBatch) public depositBatches;
-    uint256 public batchCounter;
+    uint256 public batchCounter = 1;
 
     /// @dev Maps user address to their batch IDs for historical tracking
     mapping(address => uint256[]) public userBatches;
 
     /// @dev Total shares ever issued
-    uint256 public totalSharesIssued;
+    uint256 public totalSharesIssued = 0;
 
     /// @dev List of supported collateral tokens
     IERC20[] public supportedCollaterals;
@@ -80,9 +80,14 @@ abstract contract ERC4626MultiCollateralVault is ERC20, Ownable , ReceiverTempla
                         INITIALIZATION
     //////////////////////////////////////////////////////////////*/
 
-    constructor(string memory _name, string memory _symbol) ERC20(_name, _symbol) {
-        batchCounter = 0;
-        totalSharesIssued = 0;
+    constructor(
+        string memory _name, 
+        string memory _symbol,
+        address _trustedForwarder
+        )
+    ERC20(_name, _symbol) 
+    ReceiverTemplate(_trustedForwarder)
+    {
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -128,19 +133,19 @@ abstract contract ERC4626MultiCollateralVault is ERC20, Ownable , ReceiverTempla
      * @param _amounts Array of collateral amounts to deposit
      * @param _sharesToMint Amount of shares to mint
      */
-    function depositCollaterals(
+    function _depositCollaterals(
         address _user,
-        address[] calldata _collaterals,
-        uint256[] calldata _amounts,
+        address[] memory _collaterals,
+        uint256[] memory _amounts,
         uint256 _sharesToMint
-    ) public virtual onlyOwner returns (uint256 batchId) {
+    ) internal virtual returns (uint256 batchId) {
         require(_user != address(0), "Invalid user address");
         require(_collaterals.length == _amounts.length, "Array length mismatch");
         require(_collaterals.length > 0, "Must deposit at least one collateral");
         require(_sharesToMint > 0, "Shares must be greater than 0");
 
         // Transfer collaterals from user to vault
-        for (uint256 i = 0; i < _collaterals.length; i++) {
+        for (uint256 i = 0; i < _collaterals.length; ++i) {
             require(_amounts[i] > 0, "Amount must be greater than 0");
             IERC20(_collaterals[i]).safeTransferFrom(_user, address(this), _amounts[i]);
             collateralBalance[_collaterals[i]] += _amounts[i];
@@ -185,12 +190,12 @@ abstract contract ERC4626MultiCollateralVault is ERC20, Ownable , ReceiverTempla
      * @param _sharesToBurn Number of shares to burn
      * @param _receiver Address to send collaterals to
      */
-    function withdrawFromBatch(
+    function _withdrawFromBatch(
         address _user,
         uint256 _batchId,
         uint256 _sharesToBurn,
         address _receiver
-    ) public virtual onlyOwner returns (address[] memory collaterals, uint256[] memory amounts) {
+    ) internal virtual returns (address[] memory collaterals, uint256[] memory amounts) {
         require(_user != address(0), "Invalid user");
         require(_receiver != address(0), "Invalid receiver");
         require(_sharesToBurn > 0, "Burn amount must be greater than 0");
@@ -204,7 +209,7 @@ abstract contract ERC4626MultiCollateralVault is ERC20, Ownable , ReceiverTempla
         collaterals = new address[](collateralLength);
         amounts = new uint256[](collateralLength);
 
-        for (uint256 i = 0; i < collateralLength; i++) {
+        for (uint256 i = 0; i < collateralLength; ++i) {
             collaterals[i] = batch.collateralTokens[i];
             // Redemption ratio: (sharesToBurn / totalSharesInBatch) × originalAmount
             amounts[i] = (_sharesToBurn * batch.collateralAmounts[i]) / batch.sharesMinted;
@@ -215,7 +220,7 @@ abstract contract ERC4626MultiCollateralVault is ERC20, Ownable , ReceiverTempla
         _burn(_user, _sharesToBurn);
 
         // Transfer collaterals out
-        for (uint256 i = 0; i < collateralLength; i++) {
+        for (uint256 i = 0; i < collateralLength; ++i) {
             IERC20(collaterals[i]).safeTransfer(_receiver, amounts[i]);
             collateralBalance[collaterals[i]] -= amounts[i];
         }
@@ -223,6 +228,32 @@ abstract contract ERC4626MultiCollateralVault is ERC20, Ownable , ReceiverTempla
         emit WithdrawalProcessed(_user, _sharesToBurn, collaterals, amounts);
 
         return (collaterals, amounts);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                    CRE REPORT PROCESSING
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev _processReport is called by ReceiverTemplate.onReport after security checks.
+    /// Report format: leading uint256 `batchId` followed by ABI-encoded payload.
+    /// - If `batchId == 0` then this is a deposit: abi.encode(uint256(0), address user, address[] collaterals, uint256[] amounts, uint256 sharesToMint)
+    /// - If `batchId != 0` then this is a redeem: abi.encode(uint256(batchId), address user, uint256 sharesToBurn, address receiver)
+    function _processReport(bytes calldata report) internal virtual override {
+        require(report.length >= 32, "Empty report");
+
+        uint256 batchId = abi.decode(report[0:32], (uint256));
+
+        if (batchId == 0) {
+            ( , address user, address[] memory collaterals, uint256[] memory amounts, uint256 sharesToMint) = abi.decode(report, (uint256, address, address[], uint256[], uint256));
+            _validateDeposit(collaterals, amounts, sharesToMint);
+            _depositCollaterals(user, collaterals, amounts, sharesToMint);
+            return;
+        } else {
+            // Redeem path
+            ( , address user2, uint256 sharesToBurn, address receiver) = abi.decode(report, (uint256, address, uint256, address));
+            _validateWithdrawal(user2, batchId, sharesToBurn);
+            _withdrawFromBatch(user2, batchId, sharesToBurn, receiver);
+        }
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -298,16 +329,16 @@ abstract contract ERC4626MultiCollateralVault is ERC20, Ownable , ReceiverTempla
      * @dev Hook for custom validation on deposit (override for custom logic)
      */
     function _validateDeposit(
-        address[] calldata _collaterals,
-        uint256[] calldata _amounts,
+        address[] memory _collaterals,
+        uint256[] memory _amounts,
         uint256 _sharesToMint
-    ) public view virtual {}
+    ) internal view virtual {}
 
     /**
      * @dev Hook for custom validation on withdrawal (override for custom logic)
      */
     function _validateWithdrawal(address _user, uint256 _batchId, uint256 _sharesToBurn)
-        public
+        internal
         view
         virtual
     {}
