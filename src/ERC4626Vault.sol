@@ -6,7 +6,7 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
-
+import {ReceiverTemplate} from "./Receiver.sol";
 /**
  * @title ERC4626MultiCollateralVault
  * @dev A minimal, customizable multi-collateral vault for unified share tokens.
@@ -22,7 +22,7 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
  * - All holders (original depositors & transferees) receive same ratios
  * - Ownership controls: CRE (Chainlink Runtime Environment) handles all state-changing operations
  */
-abstract contract ERC4626MultiCollateralVault is ERC20, Ownable {
+abstract contract ERC4626MultiCollateralVault is ERC20, Ownable , ReceiverTemplate {
     using SafeERC20 for IERC20;
     using Math for uint256;
 
