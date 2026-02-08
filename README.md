@@ -565,25 +565,22 @@ function calculateCollateralsForShares(uint256 sharesToRedeem, bytes32 batchId)
 CRE executes workflows that orchestrate price fetching, consensus aggregation, and contract calls via callback pattern:
 
 ```solidity
-// Called by CRE workflow callback to transfer collaterals and mint shares
-// priceData contains BFT-verified consensus proof from Capability DON
-// Updates global pool state (not user-specific)
-function transferCollateralsAndMintShares(
-    address user,
-    address[] calldata collaterals,
-    uint256[] calldata amounts,
-    uint256 shareAmount,
-    bytes calldata priceData  // Consensus-verified price proof
-) external onlyCREWorkflow verifyConsensusProof(priceData)
-// Called by CRE workflow callback to handle redemptions
-// Receives verified price data from consensus aggregation
-function redeemSharesCallback(
-    address user,
-    uint256 sharesToBurn,
-    address[] calldata collaterals,
-    uint256[] calldata amounts,
-    bytes calldata priceData  // Consensus-verified price proof
-) external onlyCREWorkflow verifyConsensusProof(priceData)
+// Consumer contracts should inherit ReceiverTemplate and implement _processReport.
+// Deposit & redeem actions are delivered by Chainlink CRE via the KeystoneForwarder
+// which calls `onReport(metadata, report)` on your contract. The contract then
+// validates the forwarder and metadata before calling `_processReport(report)`.
+//
+// Report encoding used by this vault:
+// - Leading uint256 `batchId` determines action:
+//     • batchId == 0 => deposit
+//         report = abi.encode(uint256(0), address user, address[] collaterals, uint256[] amounts, uint256 sharesToMint)
+//     • batchId != 0 => redeem from existing batch
+//         report = abi.encode(uint256(batchId), address user, uint256 sharesToBurn, address receiver)
+//
+// Implementation note: `_depositCollaterals` and `_withdrawFromBatch` are internal
+// functions invoked by `_processReport` after validation. They are NOT callable
+// directly by external callers; all state changes must be performed via authenticated
+// CRE reports delivered through the forwarder.
 ```
 
 **CRE Workflow Example (TypeScript SDK):**
@@ -593,74 +590,51 @@ function redeemSharesCallback(
 handler(
   httpTrigger.trigger({ endpoint: "/deposit" }),
   async (runtime: Runtime<Config>) => {
-    // Step 1: Fetch prices from multiple independent nodes (Capability DON)
-    // CRE automatically aggregates results via BFT consensus
     const priceResult = await runtime.invoke("price_fetch_capability", {
       tokens: ["ETH", "BTC", "SOL", "USDC"]
     })
-    
-    // prices are BFT-consensus verified across all DON nodes
-    const prices = priceResult.consensus_result
-    
-    // Step 2: Calculate shares based on consensus prices
-    const shareAmount = calculateShares(
-      deposits,
-      prices
+
+    const shareAmount = calculateShares(deposits, priceResult.consensus_result)
+
+    // Build report bytes with leading batchId == 0 for a deposit
+    const report = ethers.utils.defaultAbiCoder.encode(
+      ["uint256","address","address[]","uint256[]","uint256"],
+      [0, userAddress, collateralArray, amountArray, shareAmount]
     )
-    
-    // Step 3: Call contract with consensus proof
-    // CRE ensures proof authenticity across DON
+
+    // Metadata is provided to the forwarder; when using the CRE runtime helpers
+    // you typically pass the target receiver contract and `report` bytes.
     await runtime.invoke("evm_write_capability", {
-      contract: "ShareTokenAddress",
-      function: "transferCollateralsAndMintShares",
-      args: [
-        userAddress,
-        collateralArray,
-        amountArray,
-        shareAmount,
-        priceResult.consensus_proof  // BFT verified
-      ]
+      contract: "ShareTokenReceiverAddress",
+      function: "onReport",
+      args: [metadataBytes, report]
     })
-    
+
     return { success: true, sharesIssued: shareAmount }
   }
 )
 
 // Redemption workflow - triggered by blockchain event
 handler(
-  evmLogTrigger.trigger({
-    contract: "ShareTokenAddress",
-    event: "RedemptionInitiated"
-  }),
+  evmLogTrigger.trigger({ contract: "ShareTokenAddress", event: "RedemptionInitiated" }),
   async (runtime: Runtime<Config>) => {
-    // Fetch latest prices with consensus
     const priceResult = await runtime.invoke("price_fetch_capability", {
       tokens: ["ETH", "BTC", "SOL", "USDC"]
     })
-    
-    // Calculate redemption amounts based on POOL RATIOS
-    // (not user-specific, works the same for any share holder)
-    const redemptionAmounts = calculateRedemption(
-      sharesToBurn,
-      totalSharesOutstanding,
-      poolCollateralAmounts,
-      priceResult.consensus_result
+
+    // Build report bytes for redeeming from a batch (batchId != 0)
+    const report = ethers.utils.defaultAbiCoder.encode(
+      ["uint256","address","uint256","address"],
+      [batchId, userAddress, sharesToBurn, receiverAddress]
     )
-    
-    // Call contract redemption callback
+
     await runtime.invoke("evm_write_capability", {
-      contract: "ShareTokenAddress",
-      function: "redeemSharesCallback",
-      args: [
-        userAddress,
-        sharesToBurn,
-        collateralArray,
-        redemptionAmounts,
-        priceResult.consensus_proof
-      ]
+      contract: "ShareTokenReceiverAddress",
+      function: "onReport",
+      args: [metadataBytes, report]
     })
-    
-    return { success: true, collateralsRedeemed: redemptionAmounts }
+
+    return { success: true }
   }
 )
 ```
