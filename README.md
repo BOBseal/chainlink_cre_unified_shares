@@ -485,159 +485,34 @@ Prices may have changed, but the composition ratio stays the same.
 
 ## Contract Functions
 
-### Share Token Contract (ERC20 with Pool-Based Redemption)
+### MultiCollateralVault (key functions)
+
+This repository's vault implementation tracks immutable deposit batches and issues ERC20 shares tied to those batches. State-changing operations are intended to be driven by authenticated Chainlink CRE reports delivered via `ReceiverTemplate.onReport`. The primary externally-visible behaviors are:
 
 ```solidity
-// ===== ERC20 STANDARD FUNCTIONS (Shares are fully transferrable) =====
-
-// Transfer shares to another wallet (standard ERC20)
+// ERC20 standard methods (inherited from ERC20)
 function transfer(address to, uint256 amount) external returns (bool)
-
-// Approve shares for spending (standard ERC20)
 function approve(address spender, uint256 amount) external returns (bool)
-
-// Transfer shares on behalf of another wallet (standard ERC20)
 function transferFrom(address from, address to, uint256 amount) external returns (bool)
-
-// Get share balance for an address
 function balanceOf(address user) external view returns (uint256)
 
-// ===== DEPOSIT FUNCTION =====
+// Admin / view
+function addCollateral(IERC20 token) external onlyOwner
+function getSupportedCollaterals() external view returns (IERC20[] memory)
+function collateralCount() external view returns (uint256)
+function getCollateralBalance(address token) external view returns (uint256)
 
-// Deposit collaterals and receive shares based on consensus-verified USD value
-function depositCollaterals(
-    address[] calldata collaterals,
-    uint256[] calldata amounts
-) external returns (uint256 sharesIssued)
-// Updates global pool state and returns shares minted
+// Batch & redemption helpers
+function getBatchDetails(uint256 batchId) public view returns (address[] memory collaterals, uint256[] memory amounts, uint256 shares, uint256 timestamp, address depositor)
+function getUserBatches(address user) public view returns (uint256[] memory)
+function previewBatchRedemption(uint256 batchId, uint256 sharesToBurn) public view returns (address[] memory collaterals, uint256[] memory amounts)
 
-// ===== REDEMPTION FUNCTION (Pool-Ratio Based) =====
-
-// Redeem shares back to collaterals using global pool ratios
-// Anyone holding shares can call this - not restricted to original depositors
-function redeemShares(
-    uint256 sharesToBurn
-) external returns (
-    address[] memory collaterals,
-    uint256[] memory amounts
-)
-// Calculation: (sharesToBurn / totalSharesOutstanding) × collateralAmountInPool
-// Critical: Returns SAME ratio regardless of caller's original deposit
-
-// ===== VIEW/QUERY FUNCTIONS =====
-
-// Get deposit history for an address (for transparency and audit trail)
-function getDepositHistory(address user)
-    external
-    view
-    returns (UserDeposit[] memory)
-
-// Get current global pool state (what's backing the shares)
-function getPoolState()
-    external
-    view
-    returns (
-        address[] memory collaterals,
-        uint256[] memory amounts,
-        uint256 totalSharesOutstanding,
-        uint256 totalUsdValue
-    )
-
-// Calculate share amount for given collaterals (for deposit preview)
-function calculateSharesForCollaterals(
-    address[] calldata collaterals,
-    uint256[] calldata amounts
-) external view returns (uint256 shareAmount)
-
-// Calculate redemption amounts for shares (for redemption preview)
-// Uses original deposit batch composition, not pool composition
-function calculateCollateralsForShares(uint256 sharesToRedeem, bytes32 batchId)
-    external
-    view
-    returns (
-        address[] memory collaterals,
-        uint256[] memory amounts
-    )
+// Note: `_depositCollaterals` and `_withdrawFromBatch` exist as internal hooks
+// and are invoked by `_processReport(bytes calldata report)`, which is called
+// by `ReceiverTemplate.onReport` after forwarder and metadata validation.
 ```
 
-### Chainlink CRE Integration
-
-CRE executes workflows that orchestrate price fetching, consensus aggregation, and contract calls via callback pattern:
-
-```solidity
-// Consumer contracts should inherit ReceiverTemplate and implement _processReport.
-// Deposit & redeem actions are delivered by Chainlink CRE via the KeystoneForwarder
-// which calls `onReport(metadata, report)` on your contract. The contract then
-// validates the forwarder and metadata before calling `_processReport(report)`.
-//
-// Report encoding used by this vault:
-// - Leading uint256 `batchId` determines action:
-//     • batchId == 0 => deposit
-//         report = abi.encode(uint256(0), address user, address[] collaterals, uint256[] amounts, uint256 sharesToMint)
-//     • batchId != 0 => redeem from existing batch
-//         report = abi.encode(uint256(batchId), address user, uint256 sharesToBurn, address receiver)
-//
-// Implementation note: `_depositCollaterals` and `_withdrawFromBatch` are internal
-// functions invoked by `_processReport` after validation. They are NOT callable
-// directly by external callers; all state changes must be performed via authenticated
-// CRE reports delivered through the forwarder.
-```
-
-**CRE Workflow Example (TypeScript SDK):**
-
-```typescript
-// Deposit workflow - triggered by HTTP request
-handler(
-  httpTrigger.trigger({ endpoint: "/deposit" }),
-  async (runtime: Runtime<Config>) => {
-    const priceResult = await runtime.invoke("price_fetch_capability", {
-      tokens: ["ETH", "BTC", "SOL", "USDC"]
-    })
-
-    const shareAmount = calculateShares(deposits, priceResult.consensus_result)
-
-    // Build report bytes with leading batchId == 0 for a deposit
-    const report = ethers.utils.defaultAbiCoder.encode(
-      ["uint256","address","address[]","uint256[]","uint256"],
-      [0, userAddress, collateralArray, amountArray, shareAmount]
-    )
-
-    // Metadata is provided to the forwarder; when using the CRE runtime helpers
-    // you typically pass the target receiver contract and `report` bytes.
-    await runtime.invoke("evm_write_capability", {
-      contract: "ShareTokenReceiverAddress",
-      function: "onReport",
-      args: [metadataBytes, report]
-    })
-
-    return { success: true, sharesIssued: shareAmount }
-  }
-)
-
-// Redemption workflow - triggered by blockchain event
-handler(
-  evmLogTrigger.trigger({ contract: "ShareTokenAddress", event: "RedemptionInitiated" }),
-  async (runtime: Runtime<Config>) => {
-    const priceResult = await runtime.invoke("price_fetch_capability", {
-      tokens: ["ETH", "BTC", "SOL", "USDC"]
-    })
-
-    // Build report bytes for redeeming from a batch (batchId != 0)
-    const report = ethers.utils.defaultAbiCoder.encode(
-      ["uint256","address","uint256","address"],
-      [batchId, userAddress, sharesToBurn, receiverAddress]
-    )
-
-    await runtime.invoke("evm_write_capability", {
-      contract: "ShareTokenReceiverAddress",
-      function: "onReport",
-      args: [metadataBytes, report]
-    })
-
-    return { success: true }
-  }
-)
-```
+The contract exposes only view and admin methods publicly; deposits and redemptions are performed by trusted reports from CRE (see Chainlink CRE Integration section below).
 
 ---
 
