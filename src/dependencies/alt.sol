@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.0;
+pragma solidity ^0.8.20;
 
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
@@ -295,100 +295,90 @@ abstract contract MultiCollateralVaultAlt is ERC20, Ownable, ReceiverTemplate {
     //////////////////////////////////////////////////////////////*/
 
     /**
-     * @dev Override _beforeTokenTransfer to handle batch rehashing on share transfers
+     * @dev Override _update to handle batch rehashing on share transfers
      * When shares are transferred between users, the receiver gets new batch entries
      * with proportional collateral amounts, rehashed for their user address
+     * 
+     * Called by transfer(), transferFrom(), _mint(), and _burn() in OpenZeppelin v5.5.0+
      */
-    function _beforeTokenTransfer(
-        address from,
-        address to,
-        uint256 amount
-    ) internal virtual override {
-        super._beforeTokenTransfer(from, to, amount);
-
+    function _update(address from, address to, uint256 amount) internal virtual override {
+        // Handle batch rehashing before calling super._update()
         // Skip for minting and burning
-        if (from == address(0) || to == address(0)) {
-            return;
-        }
+        if (from != address(0) && to != address(0) && amount > 0) {
+            // Get the sender's balance before transfer for correct ratio calculation
+            uint256 senderBalanceBeforeTransfer = balanceOf(from);
 
-        // Skip if no shares are being transferred
-        if (amount == 0) {
-            return;
-        }
+            // For each batch the sender has, create proportional batches for receiver
+            bytes32[] memory fromBatches = userBatchHashes[from];
+            for (uint256 i = 0; i < fromBatches.length; ++i) {
+                bytes32 fromBatchHash = fromBatches[i];
+                DepositBatch storage fromBatch = userDepositBatches[from][fromBatchHash];
 
-        // For each batch the sender has, create proportional batches for receiver
-        bytes32[] memory fromBatches = userBatchHashes[from];
-        for (uint256 i = 0; i < fromBatches.length; ++i) {
-            bytes32 fromBatchHash = fromBatches[i];
-            DepositBatch storage fromBatch = userDepositBatches[from][fromBatchHash];
+                if (fromBatch.sharesMinted == 0) continue;
 
-            if (fromBatch.sharesMinted == 0) continue;
+                // Calculate shares from this batch being transferred
+                // This is based on pro-rata distribution assuming all shares are fungible
+                uint256 sharesToTransfer = (amount * fromBatch.sharesMinted) / senderBalanceBeforeTransfer;
 
-            // Calculate proportion of this batch being transferred
-            uint256 senderBalance = balanceOf(from) - amount; // Check balance AFTER transfer
-            // Actually, we need the balance BEFORE transfer for correct ratio
-            uint256 proportionNumerator = amount;
-            uint256 proportionDenominator = balanceOf(from) + amount; // Total before transfer
+                if (sharesToTransfer == 0) continue;
 
-            // Calculate shares from this batch being transferred
-            // This is based on pro-rata distribution assuming all shares are fungible
-            uint256 sharesToTransfer = (amount * fromBatch.sharesMinted) / (balanceOf(from) + amount);
+                // Get collaterals from sender's batch
+                address[] memory collaterals = userBatchCollateralTokens[from][fromBatchHash];
 
-            if (sharesToTransfer == 0) continue;
-
-            // Get collaterals from sender's batch
-            address[] memory collaterals = userBatchCollateralTokens[from][fromBatchHash];
-
-            // Create new amounts proportional to transfer
-            uint256[] memory transferredAmounts = new uint256[](collaterals.length);
-            for (uint256 j = 0; j < collaterals.length; ++j) {
-                address token = collaterals[j];
-                uint256 originalAmount = fromBatch.collateralAmounts[token];
-                transferredAmounts[j] = (originalAmount * sharesToTransfer) / fromBatch.sharesMinted;
-            }
-
-            // Generate new batch hash for receiver using their address and same collaterals
-            bytes32 toBatchHash = _generateBatchHash(to, collaterals, transferredAmounts);
-
-            // Create or update receiver's batch
-            DepositBatch storage toBatch = userDepositBatches[to][toBatchHash];
-
-            // If this is a new batch for receiver, initialize it
-            if (toBatch.sharesMinted == 0) {
-                toBatch.collateralHash = toBatchHash;
-                toBatch.depositTimestamp = block.timestamp;
-                toBatch.collateralCount = collaterals.length;
-
-                // Track batch hash for receiver
-                userBatchHashes[to].push(toBatchHash);
-            }
-
-            // Add collateral amounts to receiver's batch
-            for (uint256 j = 0; j < collaterals.length; ++j) {
-                address token = collaterals[j];
-                toBatch.collateralAmounts[token] += transferredAmounts[j];
-                if (!batchCollaterals[toBatchHash][token]) {
-                    batchCollaterals[toBatchHash][token] = true;
+                // Create new amounts proportional to transfer
+                uint256[] memory transferredAmounts = new uint256[](collaterals.length);
+                for (uint256 j = 0; j < collaterals.length; ++j) {
+                    address token = collaterals[j];
+                    uint256 originalAmount = fromBatch.collateralAmounts[token];
+                    transferredAmounts[j] = (originalAmount * sharesToTransfer) / fromBatch.sharesMinted;
                 }
+
+                // Generate new batch hash for receiver using their address and same collaterals
+                bytes32 toBatchHash = _generateBatchHash(to, collaterals, transferredAmounts);
+
+                // Create or update receiver's batch
+                DepositBatch storage toBatch = userDepositBatches[to][toBatchHash];
+
+                // If this is a new batch for receiver, initialize it
+                if (toBatch.sharesMinted == 0) {
+                    toBatch.collateralHash = toBatchHash;
+                    toBatch.depositTimestamp = block.timestamp;
+                    toBatch.collateralCount = collaterals.length;
+
+                    // Track batch hash for receiver
+                    userBatchHashes[to].push(toBatchHash);
+                }
+
+                // Add collateral amounts to receiver's batch
+                for (uint256 j = 0; j < collaterals.length; ++j) {
+                    address token = collaterals[j];
+                    toBatch.collateralAmounts[token] += transferredAmounts[j];
+                    if (!batchCollaterals[toBatchHash][token]) {
+                        batchCollaterals[toBatchHash][token] = true;
+                    }
+                }
+
+                // Store tokens for receiver's batch if not already stored
+                if (userBatchCollateralTokens[to][toBatchHash].length == 0) {
+                    userBatchCollateralTokens[to][toBatchHash] = collaterals;
+                }
+
+                // Update shares
+                toBatch.sharesMinted += sharesToTransfer;
+
+                // Update sender's batch (reduce shares and collateral amounts)
+                fromBatch.sharesMinted -= sharesToTransfer;
+                for (uint256 j = 0; j < collaterals.length; ++j) {
+                    address token = collaterals[j];
+                    fromBatch.collateralAmounts[token] -= transferredAmounts[j];
+                }
+
+                emit ShareTransferWithBatchRehash(from, to, amount, fromBatchHash, toBatchHash);
             }
-
-            // Store tokens for receiver's batch if not already stored
-            if (userBatchCollateralTokens[to][toBatchHash].length == 0) {
-                userBatchCollateralTokens[to][toBatchHash] = collaterals;
-            }
-
-            // Update shares
-            toBatch.sharesMinted += sharesToTransfer;
-
-            // Update sender's batch (reduce shares and collateral amounts)
-            fromBatch.sharesMinted -= sharesToTransfer;
-            for (uint256 j = 0; j < collaterals.length; ++j) {
-                address token = collaterals[j];
-                fromBatch.collateralAmounts[token] -= transferredAmounts[j];
-            }
-
-            emit ShareTransferWithBatchRehash(from, to, amount, fromBatchHash, toBatchHash);
         }
+
+        // Call parent's _update to handle the actual token transfer
+        super._update(from, to, amount);
     }
 
     /*//////////////////////////////////////////////////////////////
