@@ -2,7 +2,7 @@
 pragma solidity ^0.8.0;
 
 import {IERC165} from "@openzeppelin/contracts/interfaces/IERC165.sol";
-import {IReceiver} from "./interfaces/IReceiver.sol";
+import {IReceiver} from "../interfaces/IReceiver.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
 /// @title ReceiverTemplate - Abstract receiver with optional permission controls
