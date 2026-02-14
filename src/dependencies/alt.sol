@@ -42,22 +42,19 @@ abstract contract MultiCollateralVaultAlt is ERC20, Ownable, ReceiverTemplate {
         uint256 collateralCount;        // Number of unique collaterals
     }
 
+    /// @dev User-specific data with their own batch mappings
+    struct UserBatchData {
+        mapping(bytes32 => DepositBatch) batches;           // User's batch tracking
+        mapping(bytes32 => address[]) batchCollaterals;     // Collateral tokens per batch
+        bytes32[] batchHashes;                              // Enumerable batch list
+        uint256 nonce;                                      // Monotonic counter for batch operations
+    }
+
     /// @dev Tracks collateral holdings in the vault
     mapping(address => uint256) public collateralBalance;  // [tokenAddress => totalAmount]
 
-    /// @dev User-wise batch tracking: user -> batchHash -> DepositBatch
-    mapping(address => mapping(bytes32 => DepositBatch)) public userDepositBatches;
-
-    /// @dev Maps user to their batch hashes for enumeration
-    mapping(address => bytes32[]) public userBatchHashes;
-
-    /// @dev Tracks which collaterals belong to which batch hash (for batch details retrieval)
-    /// batchHash -> collateral address -> is supported in this batch
-    mapping(bytes32 => mapping(address => bool)) public batchCollaterals;
-
-    /// @dev Tracks all collateral addresses in a batch
-    /// user -> batchHash -> collateral addresses array (stored as encoded list)
-    mapping(address => mapping(bytes32 => address[])) public userBatchCollateralTokens;
+    /// @dev User profile data: user address -> UserBatchData
+    mapping(address => UserBatchData) private userBatchData;
 
     /// @dev Total shares ever issued
     uint256 public totalSharesIssued = 0;
@@ -159,6 +156,31 @@ abstract contract MultiCollateralVaultAlt is ERC20, Ownable, ReceiverTemplate {
     }
 
     /*//////////////////////////////////////////////////////////////
+                    USER BATCH DATA HELPERS
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @dev Get reference to user's batch data
+     */
+    function _getUserBatchData(address _user) internal view returns (UserBatchData storage) {
+        return userBatchData[_user];
+    }
+
+    /**
+     * @dev Get reference to user's specific batch
+     */
+    function _getUserBatch(address _user, bytes32 _batchHash) internal view returns (DepositBatch storage) {
+        return userBatchData[_user].batches[_batchHash];
+    }
+
+    /**
+     * @dev Increment user's nonce (for tracking operations)
+     */
+    function _incrementUserNonce(address _user) internal {
+        userBatchData[_user].nonce++;
+    }
+
+    /*//////////////////////////////////////////////////////////////
                     DEPOSIT LOGIC (Called by CRE)
     //////////////////////////////////////////////////////////////*/
 
@@ -193,34 +215,32 @@ abstract contract MultiCollateralVaultAlt is ERC20, Ownable, ReceiverTemplate {
         // Generate batch hash from collaterals and user
         batchHash = _generateBatchHash(_user, _collaterals, _amounts);
 
+        // Get user's batch data
+        UserBatchData storage userData = _getUserBatchData(_user);
+
         // Create user-wise deposit batch
-        DepositBatch storage batch = userDepositBatches[_user][batchHash];
+        DepositBatch storage batch = userData.batches[batchHash];
         batch.collateralHash = batchHash;
         batch.sharesMinted = _sharesToMint;
         batch.depositTimestamp = block.timestamp;
         batch.collateralCount = _collaterals.length;
 
-        // Store collateral amounts and tokens
+        // Store collateral amounts
         for (uint256 i = 0; i < _collaterals.length; ++i) {
             batch.collateralAmounts[_collaterals[i]] = _amounts[i];
-            batchCollaterals[batchHash][_collaterals[i]] = true;
         }
 
         // Store collateral tokens for this batch
-        userBatchCollateralTokens[_user][batchHash] = _collaterals;
+        userData.batchCollaterals[batchHash] = _collaterals;
 
-        // Track batch hash for user (if not already tracked)
-        bool batchExists = false;
-        bytes32[] storage userBatches = userBatchHashes[_user];
-        for (uint256 i = 0; i < userBatches.length; ++i) {
-            if (userBatches[i] == batchHash) {
-                batchExists = true;
-                break;
-            }
+        // Add batch hash to user's enumerable list if not already present
+        // Use nonce-based checking: if batch shares were 0, it's new
+        if (batch.sharesMinted == _sharesToMint && batch.depositTimestamp == block.timestamp) {
+            userData.batchHashes.push(batchHash);
         }
-        if (!batchExists) {
-            userBatchHashes[_user].push(batchHash);
-        }
+
+        // Increment user's operation nonce
+        _incrementUserNonce(_user);
 
         // Mint shares
         _mint(_user, _sharesToMint);
@@ -259,11 +279,13 @@ abstract contract MultiCollateralVaultAlt is ERC20, Ownable, ReceiverTemplate {
         require(_sharesToBurn > 0, "Burn amount must be greater than 0");
         require(balanceOf(_user) >= _sharesToBurn, "Insufficient share balance");
 
-        DepositBatch storage batch = userDepositBatches[_user][_batchHash];
+        // Get user's batch data
+        UserBatchData storage userData = _getUserBatchData(_user);
+        DepositBatch storage batch = userData.batches[_batchHash];
         require(batch.sharesMinted > 0, "Invalid batch hash");
 
-        // Get collaterals for this batch
-        collaterals = userBatchCollateralTokens[_user][_batchHash];
+        // Get collaterals for this batch - NO LOOP needed, direct mapping access
+        collaterals = userData.batchCollaterals[_batchHash];
         uint256 collateralLength = collaterals.length;
         amounts = new uint256[](collateralLength);
 
@@ -284,6 +306,9 @@ abstract contract MultiCollateralVaultAlt is ERC20, Ownable, ReceiverTemplate {
             IERC20(collaterals[i]).safeTransfer(_receiver, amounts[i]);
             collateralBalance[collaterals[i]] -= amounts[i];
         }
+
+        // Increment user's operation nonce
+        _incrementUserNonce(_user);
 
         emit WithdrawalProcessed(_user, _batchHash, _sharesToBurn, collaterals, amounts);
 
@@ -308,11 +333,15 @@ abstract contract MultiCollateralVaultAlt is ERC20, Ownable, ReceiverTemplate {
             // Get the sender's balance before transfer for correct ratio calculation
             uint256 senderBalanceBeforeTransfer = balanceOf(from);
 
+            // Get user data structures directly
+            UserBatchData storage fromUserData = _getUserBatchData(from);
+            UserBatchData storage toUserData = _getUserBatchData(to);
+
             // For each batch the sender has, create proportional batches for receiver
-            bytes32[] memory fromBatches = userBatchHashes[from];
+            bytes32[] memory fromBatches = fromUserData.batchHashes;
             for (uint256 i = 0; i < fromBatches.length; ++i) {
                 bytes32 fromBatchHash = fromBatches[i];
-                DepositBatch storage fromBatch = userDepositBatches[from][fromBatchHash];
+                DepositBatch storage fromBatch = fromUserData.batches[fromBatchHash];
 
                 if (fromBatch.sharesMinted == 0) continue;
 
@@ -322,8 +351,8 @@ abstract contract MultiCollateralVaultAlt is ERC20, Ownable, ReceiverTemplate {
 
                 if (sharesToTransfer == 0) continue;
 
-                // Get collaterals from sender's batch
-                address[] memory collaterals = userBatchCollateralTokens[from][fromBatchHash];
+                // Get collaterals from sender's batch - NO LOOP needed
+                address[] memory collaterals = fromUserData.batchCollaterals[fromBatchHash];
 
                 // Create new amounts proportional to transfer
                 uint256[] memory transferredAmounts = new uint256[](collaterals.length);
@@ -337,7 +366,7 @@ abstract contract MultiCollateralVaultAlt is ERC20, Ownable, ReceiverTemplate {
                 bytes32 toBatchHash = _generateBatchHash(to, collaterals, transferredAmounts);
 
                 // Create or update receiver's batch
-                DepositBatch storage toBatch = userDepositBatches[to][toBatchHash];
+                DepositBatch storage toBatch = toUserData.batches[toBatchHash];
 
                 // If this is a new batch for receiver, initialize it
                 if (toBatch.sharesMinted == 0) {
@@ -346,21 +375,14 @@ abstract contract MultiCollateralVaultAlt is ERC20, Ownable, ReceiverTemplate {
                     toBatch.collateralCount = collaterals.length;
 
                     // Track batch hash for receiver
-                    userBatchHashes[to].push(toBatchHash);
+                    toUserData.batchHashes.push(toBatchHash);
+                    toUserData.batchCollaterals[toBatchHash] = collaterals;
                 }
 
                 // Add collateral amounts to receiver's batch
                 for (uint256 j = 0; j < collaterals.length; ++j) {
                     address token = collaterals[j];
                     toBatch.collateralAmounts[token] += transferredAmounts[j];
-                    if (!batchCollaterals[toBatchHash][token]) {
-                        batchCollaterals[toBatchHash][token] = true;
-                    }
-                }
-
-                // Store tokens for receiver's batch if not already stored
-                if (userBatchCollateralTokens[to][toBatchHash].length == 0) {
-                    userBatchCollateralTokens[to][toBatchHash] = collaterals;
                 }
 
                 // Update shares
@@ -375,6 +397,10 @@ abstract contract MultiCollateralVaultAlt is ERC20, Ownable, ReceiverTemplate {
 
                 emit ShareTransferWithBatchRehash(from, to, amount, fromBatchHash, toBatchHash);
             }
+
+            // Increment both users' operation nonces
+            _incrementUserNonce(from);
+            _incrementUserNonce(to);
         }
 
         // Call parent's _update to handle the actual token transfer
@@ -431,10 +457,11 @@ abstract contract MultiCollateralVaultAlt is ERC20, Ownable, ReceiverTemplate {
             uint256 timestamp
         )
     {
-        DepositBatch storage batch = userDepositBatches[_user][_batchHash];
+        UserBatchData storage userData = _getUserBatchData(_user);
+        DepositBatch storage batch = userData.batches[_batchHash];
         require(batch.sharesMinted > 0, "Invalid batch ID");
 
-        collaterals = userBatchCollateralTokens[_user][_batchHash];
+        collaterals = userData.batchCollaterals[_batchHash];
         amounts = new uint256[](collaterals.length);
 
         for (uint256 i = 0; i < collaterals.length; ++i) {
@@ -453,14 +480,21 @@ abstract contract MultiCollateralVaultAlt is ERC20, Ownable, ReceiverTemplate {
      * @dev Get all batch hashes for a user
      */
     function getUserBatchHashes(address _user) public view returns (bytes32[] memory) {
-        return userBatchHashes[_user];
+        return _getUserBatchData(_user).batchHashes;
     }
 
     /**
      * @dev Get number of batches for a user
      */
     function getUserBatchCount(address _user) public view returns (uint256) {
-        return userBatchHashes[_user].length;
+        return _getUserBatchData(_user).batchHashes.length;
+    }
+
+    /**
+     * @dev Get user's operation nonce
+     */
+    function getUserNonce(address _user) public view returns (uint256) {
+        return _getUserBatchData(_user).nonce;
     }
 
     /**
@@ -471,10 +505,11 @@ abstract contract MultiCollateralVaultAlt is ERC20, Ownable, ReceiverTemplate {
         view
         returns (address[] memory collaterals, uint256[] memory amounts)
     {
-        DepositBatch storage batch = userDepositBatches[_user][_batchHash];
+        UserBatchData storage userData = _getUserBatchData(_user);
+        DepositBatch storage batch = userData.batches[_batchHash];
         require(batch.sharesMinted > 0, "Invalid batch ID");
 
-        collaterals = userBatchCollateralTokens[_user][_batchHash];
+        collaterals = userData.batchCollaterals[_batchHash];
         amounts = new uint256[](collaterals.length);
 
         for (uint256 i = 0; i < collaterals.length; ++i) {

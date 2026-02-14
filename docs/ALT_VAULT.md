@@ -137,9 +137,31 @@ Bob's New Batch (rehashed):
 
 ## State Management & Data Structures
 
-### Core Mappings
+### Core Structures
 
-#### 1. DepositBatch Structure
+#### 1. UserBatchData Structure
+```solidity
+struct UserBatchData {
+    mapping(bytes32 => DepositBatch) batches;           // User's batch tracking
+    mapping(bytes32 => address[]) batchCollaterals;     // Collateral tokens per batch
+    bytes32[] batchHashes;                              // Enumerable batch list
+    uint256 nonce;                                      // Monotonic counter for batch operations
+}
+```
+
+**Purpose:** Each user has their own isolated data structure containing:
+- **batches:** Direct mapping to get any batch by hash (O(1) lookup)
+- **batchCollaterals:** Pre-stored collateral arrays (no enumeration needed)
+- **batchHashes:** Enumerable list for iteration when needed
+- **nonce:** Tracks number of user operations (deposits/withdrawals/transfers)
+
+**Benefits:**
+- Eliminates nested mapping overhead
+- Single data structure per user keeps related data together
+- Nonce enables operation tracking and replay protection
+- batchCollaterals pre-caching removes array enumeration overhead
+
+#### 2. DepositBatch Structure
 ```solidity
 struct DepositBatch {
     bytes32 collateralHash;         // Hash identifier of collaterals
@@ -156,27 +178,35 @@ struct DepositBatch {
 - Reduces memory operations during transfers
 - Gas-efficient batch rebalancing
 
-#### 2. User Batch Tracking
+### Core Mappings & Storage
+
+#### User Data Storage
 ```solidity
-// Direct batch lookup: user -> batchHash -> batch details
-mapping(address => mapping(bytes32 => DepositBatch)) public userDepositBatches;
-
-// User's batch enumeration list
-mapping(address => bytes32[]) public userBatchHashes;
-
-// Batch collateral membership
-mapping(address => mapping(bytes32 => address[])) public userBatchCollateralTokens;
-
-// Quick membership check
-mapping(bytes32 => mapping(address => bool)) public batchCollaterals;
+// Central user data: each user has isolated UserBatchData
+mapping(address => UserBatchData) private userBatchData;
 ```
 
-#### 3. Collateral Management
+**Direct Access Pattern:**
 ```solidity
-// Global collateral tracking
-mapping(address => uint256) public collateralBalance;
+UserBatchData storage userData = userBatchData[_user];
 
-// Supported collateral registry (uses mapping for O(1) lookup)
+// Get batch directly - O(1)
+DepositBatch storage batch = userData.batches[batchHash];
+
+// Get collaterals directly - no enumeration
+address[] storage collaterals = userData.batchCollaterals[batchHash];
+
+// Iteration if needed
+bytes32[] storage batchHashes = userData.batchHashes;
+```
+
+#### Collateral Tracking (Global)
+```solidity
+mapping(address => uint256) public collateralBalance;  // Total vault holdings per token
+```
+
+#### Collateral Registration
+```solidity
 mapping(address => bool) public supportedCollateralsMap;
 address[] public supportedCollateralsList;
 ```
@@ -197,16 +227,21 @@ address[] public supportedCollateralsList;
 3. Update global collateral balance tracking
 4. Generate deterministic batch hash:
    - keccak256(abi.encode(user, collaterals, amounts))
-5. Create user-specific DepositBatch structure
+5. Get user's UserBatchData (creates if doesn't exist)
+6. Create/update DepositBatch in userData.batches[hash]:
    - Store collateral amounts in per-token mappings
    - Record deposit timestamp and collateral count
-6. Register batch hash in userBatchHashes[user]
-7. Mint ERC20 shares to user
-8. Update totalSharesIssued counter
-9. Emit DepositProcessed event
+7. Cache collateral tokens in userData.batchCollaterals[hash] (pre-computed)
+8. Add batch hash to userData.batchHashes enumeration (if new)
+9. Increment userData.nonce
+10. Mint ERC20 shares to user
+11. Update totalSharesIssued counter
+12. Emit DepositProcessed event
 ```
 
 **Return Value:** `bytes32 batchHash`
+
+**Optimization:** No array enumeration during deposit - direct mapping access only
 
 ---
 
@@ -218,21 +253,26 @@ address[] public supportedCollateralsList;
 **Process:**
 ```
 1. Validate inputs (valid user, receiver, burn amount, balance check)
-2. Retrieve batch details: userDepositBatches[user][batchHash]
-3. Calculate redemption amounts per collateral:
-   - For each collateral in batch:
+2. Get user's UserBatchData
+3. Retrieve batch directly: userData.batches[batchHash]
+4. Get pre-cached collaterals: userData.batchCollaterals[batchHash] (NO ENUMERATION)
+5. Calculate redemption amounts per collateral:
+   - For each collateral in batch (using pre-cached array):
    - amount = (sharesToBurn / batchTotalShares) × originalAmount
-4. Burn shares from user
-5. Transfer collaterals to receiver
-6. Update global collateral balances
-7. Emit WithdrawalProcessed event
+6. Burn shares from user
+7. Transfer collaterals to receiver
+8. Update global collateral balances
+9. Increment userData.nonce
+10. Emit WithdrawalProcessed event
 ```
 
 **Key Property:** Redemption is based on **original batch composition**, not current vault state
 
+**Optimization:** Pre-cached collateral tokens eliminate mapping enumeration
+
 ---
 
-### Share Transfer Batch Rehashing: `_beforeTokenTransfer()`
+### Share Transfer Batch Rehashing: `_update()`
 
 **Triggered By:** Standard ERC20 transfers (transfer, transferFrom)  
 **Scope:** Only for wallet-to-wallet transfers (skips mints/burns)
@@ -240,38 +280,58 @@ address[] public supportedCollateralsList;
 **Detailed Process:**
 
 ```solidity
-function _beforeTokenTransfer(address from, address to, uint256 amount)
+function _update(address from, address to, uint256 amount)
 
 For each source batch from sender:
   
-  A. Calculate Transfer Proportion:
-     - sharesToTransfer = (amount × batchShares) / (senderBalance + amount)
+  A. Get Sender and Receiver UserBatchData:
+     - UserBatchData storage fromUserData = userBatchData[from]
+     - UserBatchData storage toUserData = userBatchData[to]
+  
+  B. Calculate Transfer Proportion:
+     - sharesToTransfer = (amount × batchShares) / senderBalanceBeforeTransfer
      - This distributes shares pro-rata across all sender's batches
   
-  B. Calculate Proportional Collaterals:
+  C. Get Pre-cached Collaterals (NO LOOP):
+     - address[] collaterals = fromUserData.batchCollaterals[batchHash]
+  
+  D. Calculate Proportional Collaterals:
      For each collateral in sender's batch:
        - transferAmount = (sharesToTransfer × originalAmount) / batchShares
   
-  C. Generate Receiver's New Batch Hash:
+  E. Generate Receiver's New Batch Hash:
+
      - newHash = keccak256(abi.encode(receiver, collaterals, proportionalAmounts))
      - This ensures receiver's batch is distinct from sender's
   
-  D. Update Receiver's Batch:
-     - Create or fetch: userDepositBatches[receiver][newHash]
+  F. Update Receiver's Batch:
+     - Create or fetch: toUserData.batches[newHash]
      - Add proportional amounts to receiver's collateralAmounts[token]
-     - Register batch hash in userBatchHashes[receiver]
-     - Update batch metadata (timestamp, count)
+     - Register batch hash in toUserData.batchHashes
+     - Pre-cache collaterals in toUserData.batchCollaterals[newHash]
   
-  E. Update Sender's Batch:
+  G. Update Sender's Batch:
      - Reduce sharesMinted by sharesToTransfer
      - Reduce each collateralAmount[token] by proportional amount
      - Batch remains active if shares > 0
   
-  F. Emit Event:
+  H. Increment Nonces:
+     - fromUserData.nonce++
+     - toUserData.nonce++
+  
+  I. Call Parent Update:
+     - super._update(from, to, amount) to handle ERC20 state changes
+  
+  J. Emit Event:
      - ShareTransferWithBatchRehash(from, to, amount, fromHash, toHash)
 ```
 
 **Critical Property:** The receiver's batch operations are **isolated** from the sender's
+
+**Optimization Highlights:**
+- Pre-cached collaterals: NO enumeration loop needed
+- Direct user struct access: Faster than nested mappings
+- Nonce tracking: Enable off-chain verification of user operations
 
 ---
 
@@ -290,9 +350,6 @@ function addCollateral(IERC20 _token) public onlyOwner
 ```solidity
 // Get all supported collateral addresses
 function getSupportedCollaterals() public view returns (address[])
-
-// Get count
-function collateralCount() public view returns (uint256)
 ```
 
 ---
@@ -325,7 +382,23 @@ function getUserBatchCount(address _user) returns (uint256)
 
 Quick way to check number of active batches without array iteration.
 
-### 4. Preview Redemption
+### 4. Get User's Operation Nonce
+```solidity
+function getUserNonce(address _user) returns (uint256)
+```
+
+Returns the monotonic operation counter for a user. Incremented on:
+- Deposit completion
+- Withdrawal completion
+- Share transfer (both sender and receiver)
+
+**Use Cases:**
+- Off-chain signature verification
+- Replay attack prevention
+- State change sequencing
+- Operation auditing
+
+### 5. Preview Redemption
 ```solidity
 function previewBatchRedemption(address _user, bytes32 _batchHash, uint256 _sharesToBurn)
   returns (address[] collaterals, uint256[] amounts)
@@ -441,31 +514,35 @@ function _validateWithdrawal(
 
 ## Gas Efficiency Considerations
 
-### 1. **Mapping-Based Storage**
+### 1. **User Struct Consolidation**
+- All user data in single `UserBatchData` struct
+- Reduced storage access patterns
+- Fewer SSTORE/SLOAD operations
+- Improved cache locality
+
+### 2. **Pre-cached Collateral Arrays**
+- `batchCollaterals[batchHash]` stores token array
+- Eliminates enumeration loops in deposit/withdrawal
+- Direct array access without mapping iteration
+- Saves gas on both read and write paths
+
+### 3. **Nonce-Based Tracking**
+- Single uint256 nonce per user
+- Cheaper than maintaining multiple counters
+- Enables replay protection
+- Useful for off-chain indexing
+
+### 4. **Mapping-Based Storage**
 - Uses mappings instead of arrays where possible
 - O(1) access instead of O(n) iteration
 - Reduced storage overhead
 
-### 2. **Hashed Batch IDs**
+### 5. **Hashed Batch IDs**
 - bytes32 hashing vs. uint256 counters
-- Saves slot space compared to storing full collateral arrays
+- Deterministic: same inputs → same hash
+- No sequential counter overhead
 
-### 3. **No Duplicate User Registration**
-```solidity
-bool batchExists = false;
-for (uint256 i = 0; i < userBatches.length; ++i) {
-    if (userBatches[i] == batchHash) {
-        batchExists = true;
-        break;
-    }
-}
-if (!batchExists) {
-    userBatchHashes[_user].push(batchHash);
-}
-```
-Prevents storing same batch hash multiple times
-
-### 4. **SafeERC20 Usage**
+### 6. **SafeERC20 Usage**
 Uses battle-tested SafeERC20 for secure token transfers with revert protection.
 
 ---
