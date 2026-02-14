@@ -493,8 +493,10 @@ Prevents over-redemption through ERC20 balance check
 - Deposits and withdrawals only via CRE consensus
 - Collateral additions only by owner
 
-### 5. **Safe Transfer Hooks**
-- `_beforeTokenTransfer()` processes before state changes
+### 5. **Safe Token Update Hooks**
+- `_update()` override processes batch rehashing before actual token state changes
+- Called by OpenZeppelin ERC20's transfer, transferFrom, _mint, and _burn
+- Sender's balance is captured before transfer for accurate proportional calculations
 - No reentrancy risk due to internal-only state updates
 - SafeERC20 prevents token callback exploits
 
