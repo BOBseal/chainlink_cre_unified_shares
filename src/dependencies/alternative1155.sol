@@ -1,59 +1,65 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import {ERC1155} from "@openzeppelin/contracts/token/ERC1155/ERC1155.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {ReceiverTemplate} from "./Receiver.sol";
+
 /**
- * @title ERC4626MultiCollateralVault
- * @dev A minimal, customizable multi-collateral vault for unified share tokens.
- * 
- * Implements share token functionality for multi-collateral deposits with immutable
- * redemption ratios based on original deposit composition. Share tokens are fully
- * transferrable (ERC20) while maintaining redemption ratios across holders.
- * 
- * Design Principles:
- * - Original deposit ratios are locked and immutable
- * - Shares are transferrable like standard ERC20
- * - Redemption based on original collateral mix, not current pool state
- * - All holders (original depositors & transferees) receive same ratios
- * - Ownership controls: CRE (Chainlink Runtime Environment) handles all state-changing operations
+ * @title ERC4626MultiCollateralVault1155
+ * @dev Multi-collateral vault using ERC1155 tokens for collateral.
+ *
+ * This mirrors the design of `MultiCollateralVault` but accepts ERC1155
+ * collateral items. Each collateral entry is a (contract, id, amount) tuple
+ * and deposit batches record those tuples immutably for ratio-based
+ * redemption.
  */
-abstract contract MultiCollateralVault is ERC20, Ownable , ReceiverTemplate {
-    using SafeERC20 for IERC20;
+/// @notice Minimal ERC1155 share token controlled by the vault (owner)
+contract ERC1155Shares is ERC1155, Ownable {
+    constructor(string memory uri_) ERC1155(uri_) Ownable(msg.sender) {}
+
+    function mint(address to, uint256 id, uint256 amount) external onlyOwner {
+        _mint(to, id, amount, "");
+    }
+
+    function burn(address from, uint256 id, uint256 amount) external onlyOwner {
+        _burn(from, id, amount);
+    }
+}
+
+abstract contract Alternative1155Vault is ReceiverTemplate {
     using Math for uint256;
+    using SafeERC20 for IERC20;
+
+    ERC1155Shares public shareToken;
 
     /*//////////////////////////////////////////////////////////////
                             TYPES & STATE
     //////////////////////////////////////////////////////////////*/
 
-    /// @dev Represents a user's deposit batch with immutable ratio
     struct DepositBatch {
-        address[] collateralTokens;      // List of collateral types
+        address[] collateralTokens;      // List of collateral ERC20 token addresses
         uint256[] collateralAmounts;     // Original amounts deposited
-        uint256 sharesMinted;            // Total shares issued for this batch
+        uint256 sharesMinted;            // Total shares issued for this tokenId
         uint256 depositTimestamp;        // When deposit was made
         address initiatingUser;          // Original depositor
     }
 
-    /// @dev Tracks collateral holdings in the vault
-    mapping(address => uint256) public collateralBalance;  // [tokenAddress => totalAmount]
-
-    /// @dev Stores deposit batches by batch ID
+    /// @dev Tracks collateral holdings in the vault: tokenAddress => totalAmount
+    mapping(address => uint256) public collateralBalance;
+a
+    /// @dev Stores deposit batches by tokenId (share id)
     mapping(uint256 => DepositBatch) public depositBatches;
-    uint256 public batchCounter = 1;
+    uint256 public tokenCounter = 1;
 
-    /// @dev Maps user address to their batch IDs for historical tracking
+    /// @dev Maps user address to their tokenIds for historical tracking
     mapping(address => uint256[]) public userBatches;
 
-    /// @dev Total shares ever issued
+    /// @dev Total shares ever issued across all tokenIds
     uint256 public totalSharesIssued = 0;
-
-    /// @dev List of supported collateral tokens
-    IERC20[] public supportedCollaterals;
 
     /*//////////////////////////////////////////////////////////////
                             EVENTS
@@ -61,7 +67,7 @@ abstract contract MultiCollateralVault is ERC20, Ownable , ReceiverTemplate {
 
     event DepositProcessed(
         address indexed user,
-        uint256 indexed batchId,
+        uint256 indexed tokenId,
         address[] collaterals,
         uint256[] amounts,
         uint256 sharesIssued
@@ -69,201 +75,153 @@ abstract contract MultiCollateralVault is ERC20, Ownable , ReceiverTemplate {
 
     event WithdrawalProcessed(
         address indexed user,
-        uint256 shares,
+        uint256 tokenId,
+        uint256 sharesBurned,
         address[] collaterals,
         uint256[] amounts
     );
-
-    event CollateralAdded(address indexed token);
 
     /*//////////////////////////////////////////////////////////////
                         INITIALIZATION
     //////////////////////////////////////////////////////////////*/
 
+    /// @param _uri ERC1155 metadata URI (can be empty)
     constructor(
-        string memory _name, 
-        string memory _symbol,
+        string memory _uri,
         address _trustedForwarder
-        )
-    ERC20(_name, _symbol) 
-    ReceiverTemplate(_trustedForwarder)
-    {
+    ) ReceiverTemplate(_trustedForwarder) {
+        shareToken = new ERC1155Shares(_uri);
     }
 
     /*//////////////////////////////////////////////////////////////
                     COLLATERAL MANAGEMENT
     //////////////////////////////////////////////////////////////*/
 
-    /**
-     * @dev Add a new supported collateral token
-     */
-    function addCollateral(IERC20 _token) public virtual onlyOwner {
-        for (uint256 i = 0; i < supportedCollaterals.length; i++) {
-            require(supportedCollaterals[i] != _token, "Collateral already supported");
-        }
-        supportedCollaterals.push(_token);
-        emit CollateralAdded(address(_token));
-    }
-
-    /**
-     * @dev Get all supported collaterals
-     */
-    function getSupportedCollaterals() public view returns (IERC20[] memory) {
-        return supportedCollaterals;
-    }
-
-    /**
-     * @dev Get count of supported collaterals
-     */
-    function collateralCount() public view returns (uint256) {
-        return supportedCollaterals.length;
-    }
+    // Collateral management is intentionally minimal; supported tokens can be
+    // validated by overriding `_validateDeposit` if needed.
 
     /*//////////////////////////////////////////////////////////////
                     DEPOSIT LOGIC (Called by CRE)
     //////////////////////////////////////////////////////////////*/
 
     /**
-     * @dev Process deposit from multiple collaterals and mint shares
-     * Called externally (typically by Chainlink CRE after consensus)
-     * Only owner (CRE) can call this function
-     * 
-     * @param _user Address receiving shares
-     * @param _collaterals Array of collateral token addresses
-     * @param _amounts Array of collateral amounts to deposit
-     * @param _sharesToMint Amount of shares to mint
+     * @dev _collaterals: array of ERC1155 contract addresses
+     * @dev _ids: array of token ids (one per collateral entry)
+     * @dev _amounts: array of amounts per (contract,id)
+     */
+    /**
+     * @dev Process deposit of multiple ERC20 collaterals and mint ERC1155 shares
+     * @param _user recipient of minted shares
+     * @param _collaterals array of ERC20 token addresses
+     * @param _amounts array of amounts per collateral
+     * @param _sharesToMint amount of share tokens to mint (ERC1155 amount)
+     * @return tokenId minted
      */
     function _depositCollaterals(
         address _user,
         address[] memory _collaterals,
         uint256[] memory _amounts,
         uint256 _sharesToMint
-    ) internal virtual returns (uint256 batchId) {
+    ) internal virtual returns (uint256 tokenId) {
         require(_user != address(0), "Invalid user address");
         require(_collaterals.length == _amounts.length, "Array length mismatch");
         require(_collaterals.length > 0, "Must deposit at least one collateral");
         require(_sharesToMint > 0, "Shares must be greater than 0");
 
-        // Transfer collaterals from user to vault
+        // Transfer ERC20 collaterals from user to vault
         for (uint256 i = 0; i < _collaterals.length; ++i) {
             require(_amounts[i] > 0, "Amount must be greater than 0");
             IERC20(_collaterals[i]).safeTransferFrom(_user, address(this), _amounts[i]);
             collateralBalance[_collaterals[i]] += _amounts[i];
         }
 
-        // Create immutable deposit batch
-        batchId = batchCounter;
-        DepositBatch storage batch = depositBatches[batchId];
+        tokenId = tokenCounter;
+        DepositBatch storage batch = depositBatches[tokenId];
         batch.collateralTokens = _collaterals;
         batch.collateralAmounts = _amounts;
         batch.sharesMinted = _sharesToMint;
         batch.depositTimestamp = block.timestamp;
         batch.initiatingUser = _user;
 
-        // Track batch for user
-        userBatches[_user].push(batchId);
+        userBatches[_user].push(tokenId);
 
-        // Mint shares
-        _mint(_user, _sharesToMint);
+        // Mint ERC1155 share tokens for this deposit batch (external share contract)
+        shareToken.mint(_user, tokenId, _sharesToMint);
         totalSharesIssued += _sharesToMint;
-        batchCounter++;
+        tokenCounter++;
 
-        emit DepositProcessed(_user, batchId, _collaterals, _amounts, _sharesToMint);
+        emit DepositProcessed(_user, tokenId, _collaterals, _amounts, _sharesToMint);
 
-        return batchId;
+        return tokenId;
     }
 
     /*//////////////////////////////////////////////////////////////
                     WITHDRAWAL LOGIC (Called by CRE)
     //////////////////////////////////////////////////////////////*/
 
-    /**
-     * @dev Process withdrawal based on original batch ratio
-     * Called externally (typically by Chainlink CRE after consensus)
-     * Only owner (CRE) can call this function
-     * 
-     * Redemption formula per collateral:
-     * Amount = (sharesToBurn / batchTotalShares) × originalCollateralAmount
-     * 
-     * @param _user Address burning shares and receiving collaterals
-     * @param _batchId ID of the batch to redeem from
-     * @param _sharesToBurn Number of shares to burn
-     * @param _receiver Address to send collaterals to
-     */
-    function _withdrawFromBatch(
+    function _withdrawFromTokenId(
         address _user,
-        uint256 _batchId,
+        uint256 _tokenId,
         uint256 _sharesToBurn,
         address _receiver
     ) internal virtual returns (address[] memory collaterals, uint256[] memory amounts) {
         require(_user != address(0), "Invalid user");
         require(_receiver != address(0), "Invalid receiver");
         require(_sharesToBurn > 0, "Burn amount must be greater than 0");
-        require(balanceOf(_user) >= _sharesToBurn, "Insufficient share balance");
+        require(shareToken.balanceOf(_user, _tokenId) >= _sharesToBurn, "Insufficient share balance");
 
-        DepositBatch storage batch = depositBatches[_batchId];
-        require(batch.sharesMinted > 0, "Invalid batch ID");
+        DepositBatch storage batch = depositBatches[_tokenId];
+        require(batch.sharesMinted > 0, "Invalid tokenId");
 
-        // Calculate redemption amounts based on original ratio
         uint256 collateralLength = batch.collateralTokens.length;
         collaterals = new address[](collateralLength);
         amounts = new uint256[](collateralLength);
 
         for (uint256 i = 0; i < collateralLength; ++i) {
             collaterals[i] = batch.collateralTokens[i];
-            // Redemption ratio: (sharesToBurn / totalSharesInBatch) × originalAmount
             amounts[i] = (_sharesToBurn * batch.collateralAmounts[i]) / batch.sharesMinted;
             require(amounts[i] > 0, "Redemption amount too small");
         }
 
-        // Burn shares
-        _burn(_user, _sharesToBurn);
+        // Burn ERC1155 share tokens from user (via share contract)
+        shareToken.burn(_user, _tokenId, _sharesToBurn);
 
-        // Transfer collaterals out
+        // Transfer ERC20 collaterals to receiver
         for (uint256 i = 0; i < collateralLength; ++i) {
             IERC20(collaterals[i]).safeTransfer(_receiver, amounts[i]);
             collateralBalance[collaterals[i]] -= amounts[i];
         }
 
-        emit WithdrawalProcessed(_user, _sharesToBurn, collaterals, amounts);
+        emit WithdrawalProcessed(_user, _tokenId, _sharesToBurn, collaterals, amounts);
 
         return (collaterals, amounts);
     }
 
-    function _update(address from, address to, uint256 amount) internal virtual override {
-        // Handle batch rehashing before calling super._update()
-        // Skip for minting and burning
-        if (from != address(0) && to != address(0) && amount > 0) {
-            
-        }
-
-        // Call parent's _update to handle the actual token transfer
-        super._update(from, to, amount);
-    }
+    // ERC1155 transfer hooks can be overridden if specific share-id rebalancing
+    // or tracking is required. By default, transfers are standard ERC1155.
 
     /*//////////////////////////////////////////////////////////////
                     CRE REPORT PROCESSING
     //////////////////////////////////////////////////////////////*/
 
-    /// @dev _processReport is called by ReceiverTemplate.onReport after security checks.
-    /// Report format: leading uint256 `batchId` followed by ABI-encoded payload.
-    /// - If `batchId == 0` then this is a deposit: abi.encode(uint256(0), address user, address[] collaterals, uint256[] amounts, uint256 sharesToMint)
-    /// - If `batchId != 0` then this is a redeem: abi.encode(uint256(batchId), address user, uint256 sharesToBurn, address receiver)
+    /// Report format for deposit:
+    /// abi.encode(uint256(0), address user, address[] collaterals, uint256[] ids, uint256[] amounts, uint256 sharesToMint)
+    /// Report format for redeem:
+    /// abi.encode(uint256(batchId), address user, uint256 sharesToBurn, address receiver)
     function _processReport(bytes calldata report) internal virtual override {
         require(report.length >= 32, "Empty report");
 
-        uint256 batchId = abi.decode(report[0:32], (uint256));
+        uint256 tokenId = abi.decode(report[0:32], (uint256));
 
-        if (batchId == 0) {
+        if (tokenId == 0) {
             ( , address user, address[] memory collaterals, uint256[] memory amounts, uint256 sharesToMint) = abi.decode(report, (uint256, address, address[], uint256[], uint256));
             _validateDeposit(collaterals, amounts, sharesToMint);
             _depositCollaterals(user, collaterals, amounts, sharesToMint);
             return;
         } else {
-            // Redeem path
             ( , address user2, uint256 sharesToBurn, address receiver) = abi.decode(report, (uint256, address, uint256, address));
-            _validateWithdrawal(user2, batchId, sharesToBurn);
-            _withdrawFromBatch(user2, batchId, sharesToBurn, receiver);
+            _validateWithdrawal(user2, tokenId, sharesToBurn);
+            _withdrawFromTokenId(user2, tokenId, sharesToBurn, receiver);
         }
     }
 
@@ -271,17 +229,11 @@ abstract contract MultiCollateralVault is ERC20, Ownable , ReceiverTemplate {
                         ACCOUNTING LOGIC
     //////////////////////////////////////////////////////////////*/
 
-    /**
-     * @dev Get total value of specific collateral in vault
-     */
     function getCollateralBalance(address _token) public view returns (uint256) {
         return collateralBalance[_token];
     }
 
-    /**
-     * @dev Get deposit batch details
-     */
-    function getBatchDetails(uint256 _batchId)
+    function getBatchDetails(uint256 _tokenId)
         public
         view
         returns (
@@ -292,7 +244,7 @@ abstract contract MultiCollateralVault is ERC20, Ownable , ReceiverTemplate {
             address depositor
         )
     {
-        DepositBatch storage batch = depositBatches[_batchId];
+        DepositBatch storage batch = depositBatches[_tokenId];
         return (
             batch.collateralTokens,
             batch.collateralAmounts,
@@ -302,23 +254,17 @@ abstract contract MultiCollateralVault is ERC20, Ownable , ReceiverTemplate {
         );
     }
 
-    /**
-     * @dev Get all batch IDs for a user
-     */
     function getUserBatches(address _user) public view returns (uint256[] memory) {
         return userBatches[_user];
     }
 
-    /**
-     * @dev Calculate redemption amounts for a given batch and share amount
-     */
-    function previewBatchRedemption(uint256 _batchId, uint256 _sharesToBurn)
+    function previewBatchRedemption(uint256 _tokenId, uint256 _sharesToBurn)
         public
         view
         returns (address[] memory collaterals, uint256[] memory amounts)
     {
-        DepositBatch storage batch = depositBatches[_batchId];
-        require(batch.sharesMinted > 0, "Invalid batch ID");
+        DepositBatch storage batch = depositBatches[_tokenId];
+        require(batch.sharesMinted > 0, "Invalid tokenId");
 
         uint256 collateralLength = batch.collateralTokens.length;
         collaterals = new address[](collateralLength);
@@ -336,21 +282,17 @@ abstract contract MultiCollateralVault is ERC20, Ownable , ReceiverTemplate {
                         OVERRIDE HOOKS
     //////////////////////////////////////////////////////////////*/
 
-    /**
-     * @dev Hook for custom validation on deposit (override for custom logic)
-     */
     function _validateDeposit(
         address[] memory _collaterals,
         uint256[] memory _amounts,
         uint256 _sharesToMint
     ) internal view virtual {}
 
-    /**
-     * @dev Hook for custom validation on withdrawal (override for custom logic)
-     */
-    function _validateWithdrawal(address _user, uint256 _batchId, uint256 _sharesToBurn)
+    function _validateWithdrawal(address _user, uint256 _tokenId, uint256 _sharesToBurn)
         internal
         view
         virtual
     {}
+
+    // Note: `supportsInterface` is inherited from `ReceiverTemplate`.
 }
