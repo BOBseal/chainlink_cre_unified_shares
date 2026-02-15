@@ -1,655 +1,833 @@
-# Unified Share Token for Multiple/Dynamic Collateral
+# Chainlink CRE Unified Shares Vault
+
+A sophisticated multi-collateral vault system for managing unified share tokens with Chainlink Automation integration. This repository implements two vault architectures: **ERC20-based shares** (`MultiCollateralVault`) and **ERC1155-based shares** (`Alternative1155Vault`).
+
+## 📋 Table of Contents
+
+- [Overview](#overview)
+- [Architecture](#architecture)
+- [Core Concepts](#core-concepts)
+- [Contract Variants](#contract-variants)
+- [Deposit Flow](#deposit-flow)
+- [Withdrawal Flow](#withdrawal-flow)
+- [Integration with Chainlink CRE](#integration-with-chainlink-cre)
+- [Setup & Installation](#setup--installation)
+- [Usage Guide](#usage-guide)
+- [API Reference](#api-reference)
+- [Security Considerations](#security-considerations)
+
+---
 
 ## Overview
 
-A protocol that allows users to deposit multiple types of collateral (ETH, BTC, SOL, USDC, etc.) across different blockchains and receive a unified **SHARE token** in return. The system leverages **Chainlink CRE (Chainlink Runtime Environment)** to orchestrate and calculate fair share allocation based on consensus-verified USD valuations of supplied collaterals.
+This project provides a **multi-collateral vault system** that enables:
+
+- **Unified Share Tokens**: Accept deposits in multiple ERC20 collateral tokens and issue a single unified share token
+- **Immutable Redemption Ratios**: Lock the original collateral composition at deposit time — redemptions always use the original ratio, regardless of current pool state
+- **Chainlink CRE Integration**: Automated deposit and withdrawal orchestration via Chainlink Automation (formerly Keeper Network) with the Chainlink Runtime Environment
+- **Two Token Standards**:
+  - `MultiCollateralVault`: ERC20 shares (transferrable like standard tokens)
+  - `Alternative1155Vault`: ERC1155 shares (batch-aware, per-tokenId tracking)
+
+### Key Features
+
+✅ **Immutable collateral ratios** locked at deposit  
+✅ **Multiple collateral support** (ERC20 tokens)  
+✅ **Transferrable shares** with consistent redemption  
+✅ **Chainlink CRE integration** for trustless automation  
+✅ **Per-user batch tracking** to avoid expensive loops  
+✅ **Gas-optimized** mappings & nested structures  
 
 ---
 
-## System Architecture
+## Architecture
 
-### Core Components
-
-```mermaid
-graph TB
-    subgraph "User Layer"
-        User["User Wallet<br/>(ETH, BTC, SOL, USDC, etc.)"]
-    end
-    
-    subgraph "Application Layer"
-        DApp["Protocol dApp<br/>(UI/UX)"]
-    end
-    
-    subgraph "Blockchain Layer"
-        ShareToken["Share Token Contract<br/>(Omnichain Compatible)"]
-        Collaterals["Collateral Contracts<br/>(ERC20 Tokens)"]
-    end
-    
-    subgraph "Oracle/Calculation Layer"
-        CRE["Chainlink CRE<br/>(Workflow Orchestration<br/>& Consensus Aggregation)"]
-    end
-    
-    User -->|Selects Collaterals| DApp
-    DApp -->|Requests Share Calculation| CRE
-    CRE -->|Calculates USD Values| Collaterals
-    CRE -->|Triggers Transfers & Minting| ShareToken
-    ShareToken -->|Mints Shares| User
-    ShareToken -->|Transfers Collaterals| Collaterals
-```
-
----
-
-## Data Structures
-
-### Share Token Contract (Global Pool State)
-
-**Critical Design Principle**: Redemption ratios are maintained **globally** based on total collateral in the pool and total shares issued. Share tokens are fully ERC20 transferrable—when shares are transferred to another wallet, the redemption ratio remains **constant** because it's determined by aggregate pool state, not individual user deposits.
-
-```solidity
-// ===== GLOBAL POOL STATE (determines redemption ratios) =====
-// Total collateral held by contract for each token
-mapping(address => uint256) totalCollateralBalance;  // [tokenAddress => amount]
-
-// Total shares ever issued
-uint256 public totalSharesIssued;
-
-// Total shares currently outstanding (circulating)
-uint256 public totalSharesOutstanding;
-
-// ===== SHARE TOKEN STATE (ERC20 Standard) =====
-// Share token balances - shares are fully transferrable
-mapping(address => uint256) shareBalance;
-
-// ERC20 approval mechanism for transfers
-mapping(address => mapping(address => uint256)) allowance;
-
-// ===== DEPOSIT HISTORY (For transparency & audit trail) =====
-// Track original deposits for historical reference
-mapping(address => UserDeposit[]) depositHistory;
-
-struct UserDeposit {
-    address[] collateralTokens;      // List of collateral types deposited
-    uint256[] collateralAmounts;     // Amounts of each collateral
-    uint256 sharesMinted;            // Shares issued for this deposit
-    uint256 usdValueAtDeposit;       // Total USD value at deposit time
-    uint256 depositTimestamp;        // When deposit was made
-    address initiatingUser;          // Original depositor
-}
-
-struct CollateralInPool {
-    address tokenAddress;            // Token contract address
-    uint256 totalAmount;             // Total amount currently in pool
-    uint256 poolRatio;               // Ratio in pool (out of 100000 = 100%)
-}
-```
-
----
-
-## Redemption Ratio Mechanism
-
-### How Original Ratios Are Preserved Across Transfers
-
-The **key principle**: Redemption ratios are determined by the **ORIGINAL DEPOSIT RATIO** of the depositor who created those shares. Share transferability doesn't change the collateral mix—the shares always redeem according to what was originally deposited.
-
-This ensures that:
-✓ Shares always redeem for the same original collateral mix
-✓ Original deposit ratios are locked in when shares are created
-✓ Share transferees receive exactly what the original depositor would receive
-✓ The protocol is fair and predictable
-
-### Original Deposit Ratio Tracking
-
-Each batch of shares tracks its origin:
-
-```
-Share Batch Data Structure:
-├─ Original Depositor: User A
-├─ Original Deposit Ratios:
-│  ├─ ETH: 10 (locked ratio)
-│  ├─ BTC: 1 (locked ratio)
-│  ├─ SOL: 30 (locked ratio)
-│  └─ USDC: 300 (locked ratio)
-├─ Shares Issued: 49,300 SHARES
-├─ Current Holder: User B (after transfer)
-└─ Redemption Amount per Share: 
-   ├─ ETH: 10 / 49,300 = 0.0002028 ETH per SHARE
-   ├─ BTC: 1 / 49,300 = 0.00002028 BTC per SHARE
-   ├─ SOL: 30 / 49,300 = 0.0006084 SOL per SHARE
-   └─ USDC: 300 / 49,300 = 0.006084 USDC per SHARE
-```
-
-### Original Deposit Ratio Calculation
-
-```
-When User redeems N shares from Deposit D:
-
-For each collateral C in the original deposit:
-  Redeemable Amount[C] = (N × Original Deposit Amount[C]) / Total Shares from Deposit D
-
-Example with original deposit of {10 ETH, 1 BTC, 30 SOL, 300 USDC} → 49,300 SHARES:
-
-If redeeming 4,930 SHARES (10% of 49,300):
-  - ETH: (4,930 × 10) / 49,300 = 1 ETH
-  - BTC: (4,930 × 1) / 49,300 = 0.1 BTC
-  - SOL: (4,930 × 30) / 49,300 = 3 SOL
-  - USDC: (4,930 × 300) / 49,300 = 30 USDC
-
-If redeeming 24,650 SHARES (50% of 49,300):
-  - ETH: (24,650 × 10) / 49,300 = 5 ETH
-  - BTC: (24,650 × 1) / 49,300 = 0.5 BTC
-  - SOL: (24,650 × 30) / 49,300 = 15 SOL
-  - USDC: (24,650 × 300) / 49,300 = 150 USDC
-```
-
-### Example: Share Transfer & Redemption (Original Ratios Preserved)
-
-```
-═══════════════════════════════════════════════════════════════
-
-STEP 1: INITIAL DEPOSIT BY USER A
-═══════════════════════════════════════════════════════════════
-
-User A deposits:
-  - 10 ETH @ $4,000 = $40,000
-  - 1 BTC @ $45,000 = $45,000  
-  - 30 SOL @ $10 = $300
-  - 300 USDC @ $1 = $300
-  Total: $49,300 USD
-
-Shares Issued: 49,300 SHARES
-
-SHARE BATCH A CREATED (immutable original deposit record):
-  Original Depositor: User A
-  Original Collaterals: [ETH: 10, BTC: 1, SOL: 30, USDC: 300]
-  Total Shares from This Deposit: 49,300
-  Redemption per SHARE:
-    - ETH: 10 / 49,300 = 0.0002028 ETH/SHARE
-    - BTC: 1 / 49,300 = 0.00002028 BTC/SHARE
-    - SOL: 30 / 49,300 = 0.0006084 SOL/SHARE
-    - USDC: 300 / 49,300 = 0.006084 USDC/SHARE
-
-GLOBAL POOL STATE (informational only, not used for this batch):
-  - Total ETH: 10
-  - Total BTC: 1
-  - Total SOL: 30
-  - Total USDC: 300
-  - Total Shares Issued: 49,300
-
-═══════════════════════════════════════════════════════════════
-
-STEP 2: USER A TRANSFERS SHARES TO USER B
-═══════════════════════════════════════════════════════════════
-
-User A transfers: 24,650 SHARES to User B
-(approximately 50% of the batch)
-
-BALANCES AFTER TRANSFER:
-  - User A: 24,650 SHARES (from Batch A)
-  - User B: 24,650 SHARES (from Batch A) ← NEW HOLDER
-  - User C: 0 SHARES
-
-⚠️  CRITICAL: Batch A's Original Ratio UNCHANGED!
-  - Original Depositor: User A
-  - Original Collaterals: {10 ETH, 1 BTC, 30 SOL, 300 USDC} ← IMMUTABLE
-  - Redemption per SHARE: Same as before
-  - Total Shares Outstanding: 49,300
-
-═══════════════════════════════════════════════════════════════
-
-STEP 3: USER B REDEEMS 24,650 SHARES
-═══════════════════════════════════════════════════════════════
-
-User B (new holder of Batch A shares) initiates redemption for 24,650 SHARES
-
-Redemption Calculation (using ORIGINAL BATCH RATIOS, not pool ratios):
-  
-  For ETH:
-    Amount = (24,650 SHARES × 10 ETH) / 49,300 Total Shares
-           = 0.5 × 10 ETH
-           = 5 ETH ✓
-  
-  For BTC:
-    Amount = (24,650 × 1 BTC) / 49,300
-           = 0.5 × 1 BTC
-           = 0.5 BTC ✓
-  
-  For SOL:
-    Amount = (24,650 × 30 SOL) / 49,300
-           = 0.5 × 30 SOL
-           = 15 SOL ✓
-  
-  For USDC:
-    Amount = (24,650 × 300 USDC) / 49,300
-           = 0.5 × 300 USDC
-           = 150 USDC ✓
-
-User B Receives: 5 ETH, 0.5 BTC, 15 SOL, 150 USDC
-              = 50% of User A's ORIGINAL deposit ✓
-
-═══════════════════════════════════════════════════════════════
-
-STEP 4: REMAINING SHARES & FUTURE REDEMPTIONS
-═══════════════════════════════════════════════════════════════
-
-Remaining Shares in Circulation:
-  - From Batch A: 24,650 SHARES (owned by User A)
-
-If User A redeems their remaining 24,650 SHARES:
-  Receives: 5 ETH, 0.5 BTC, 15 SOL, 150 USDC
-  (Same original ratio maintained!)
-
-═══════════════════════════════════════════════════════════════
-
-KEY INSIGHT:
-✓ User A (original depositor) redeems 24,650 shares → Gets 50% of original
-✓ User B (transferee) redeems 24,650 shares → Gets 50% of original (SAME!)
-✓ Original ratio locked at deposit time: {10 ETH, 1 BTC, 30 SOL, 300 USDC}
-✓ Transferability doesn't change the ratio
-✓ Fair for all holders: original depositor AND secondary buyers
-
-═══════════════════════════════════════════════════════════════
-```
-
----
-
-## User Deposit Workflow
-
-### Step-by-Step Flow
-
-```mermaid
-sequenceDiagram
-    actor User
-    participant DApp as Protocol dApp
-    participant CRE as Chainlink CRE<br/>(Workflow DON)
-    participant ShareToken as Share Token Contract
-    participant Collateral as Collateral ERC20
-    
-    User->>DApp: 1. Select collaterals<br/>(10 ETH, 1 BTC, 30 SOL, 300 USDC)
-    DApp->>CRE: 2. Trigger workflow:<br/>Request share calculation
-    
-    CRE->>CRE: 3. Workflow callback invoked<br/>across DON nodes
-    CRE->>CRE: 4. Fetch price feeds<br/>(via Capability DON with consensus)
-    CRE->>CRE: 5. BFT Consensus aggregation:<br/>ETH: $40,000 (verified)<br/>BTC: $45,000 (verified)<br/>SOL: $300 (verified)<br/>USDC: $300 (verified)<br/>Total: $49,300
-    
-    CRE->>CRE: 6. Calculate share amount<br/>(e.g., 49,300 SHARES)
-    
-    CRE->>ShareToken: 7. Call transferCollaterals()<br/>& mintShares()<br/>(with consensus proof)
-    
-    ShareToken->>Collateral: 8. transferFrom User → Contract<br/>(for each collateral)
-    Collateral->>ShareToken: 9. Tokens received
-    
-    ShareToken->>User: 10. Mint 49,300 SHARE tokens
-    ShareToken->>ShareToken: 11. Save deposit data<br/>(user mappings, balances,<br/>collateral holdings)
-    
-    ShareToken-->>User: ✓ Deposit Complete
-```
-
----
-
-## Data Storage Example
-
-When a user deposits (10 ETH, 1 BTC, 30 SOL, 300 USDC):
-
-```mermaid
-graph LR
-    User["User: 0x1234..."]
-    
-    User -->|UserAccount| Account["<b>Account Data</b><br/>collateralTokens: [ETH, BTC, SOL, USDC]<br/>collateralAmounts: [10, 1, 30, 300]<br/>shareTokensMinted: 49,300<br/>depositTimestamp: block.timestamp"]
-    
-    User -->|Share Balance| Balance["<b>Balance Mapping</b><br/>shareBalance: 49,300"]
-    
-    User -->|Collaterals| Holdings["<b>Collateral Holdings</b><br/>[1] ETH: 10 @ $4,000 (8.1%)<br/>[2] BTC: 1 @ $45,000 (91.3%)<br/>[3] SOL: 30 @ $10 (0.6%)<br/>[4] USDC: 300 @ $1 (0%)"]
-```
-
----
-
-## Redemption Workflow
-
-### Redeeming Shares Back to Original Collaterals
-
-```mermaid
-sequenceDiagram
-    actor User
-    participant ShareToken as Share Token Contract
-    participant CRE as Chainlink CRE<br/>(Workflow DON)
-    participant Collateral as Collateral ERC20
-    
-    User->>ShareToken: 1. Initiate redemption<br/>(burn X SHARE tokens)
-    
-    ShareToken->>CRE: 2. Trigger redemption workflow<br/>(user address, shares to redeem)
-    
-    CRE->>CRE: 3. Workflow callback execution<br/>across DON nodes
-    CRE->>CRE: 4. Fetch current price feeds<br/>(via Capability DON)
-    CRE->>CRE: 5. BFT Consensus aggregation<br/>of current prices (verified)
-    CRE->>CRE: 6. Calculate redemption amounts<br/>based on original supply ratios:<br/>ETH: 10 * (8.1%) = 0.81 ETH<br/>BTC: 1 * (91.3%) = 0.913 BTC<br/>SOL: 30 * (0.6%) = 0.18 SOL
-    
-    CRE->>ShareToken: 7. Call redeemCallback()<br/>(with consensus proof)
-    
-    ShareToken->>ShareToken: 8. Burn SHARE tokens
-    
-    ShareToken->>Collateral: 9. transferFrom Contract → User<br/>(for each collateral)
-    
-    Collateral->>User: 10. Receive collaterals based on<br/>POOL RATIOS (not user-specific)
-    
-    ShareToken->>ShareToken: 11. Update global pool state &<br/>burn shares
-    
-    User-->>User: ✓ Redemption Complete<br/>(ratio preserved across all holders)
-```
-
-**Important**: The redemption amounts are calculated using the **original deposit ratios**, not individual deposit history. This means:
-- Any wallet holding shares (original depositor or transferee) receives the same original collateral mix
-- The ratio is: (Shares to Redeem / Total Shares from This Deposit) × (Each Original Collateral Amount)
-- Ratios are immutable and determined at deposit time
-
----
-
-## Key Features
-
-### 1. **Fully Transferrable Share Tokens (ERC20 Standard)**
-- Share tokens are standard ERC20 tokens with full transfer and trading capabilities
-- Users can sell, trade, or gift shares to other wallets
-- Share transfers don't affect redemption ratios for any holder
-- Both original depositors and secondary market participants can redeem anytime
-
-### 2. **Immutable Original Deposit Ratios Across Transfers**
-- Each share batch maintains the **original deposit ratio** when created
-- Redemption is based on what the original depositor supplied, not current pool state
-- Any wallet holding shares receives the exact collateral mix the original depositor would get
-- Ratio formula: (Shares to Redeem / Total Shares from Deposit) × (Original Collateral Amount)
-- **Example**: If original deposit was {10 ETH, 1 BTC, 30 SOL, 300 USDC}, redeeming 50% of those shares yields 50% of each
-- Ratios are immutable and predictable regardless of other deposits or redemptions
-
-### 3. **Multi-Chain Support**
-- Share token is omnichain compatible (e.g., via LayerZero, IBC)
-- Users can deposit collaterals from different blockchains
-- Single unified SHARE token across all chains
-- CRE orchestrates operations across multiple blockchains
-
-### 4. **Decentralized Consensus-Based Valuation**
-- Chainlink CRE fetches price feeds via Capability DON (Decentralized Oracle Network)
-- Byzantine Fault Tolerant (BFT) consensus aggregates results from independent nodes
-- Multiple independent nodes verify every price feed and calculation
-- Share calculation based on consensus-verified USD values
-- Eliminates single points of failure (no reliance on single API provider)
-
-### 5. **Workflow Orchestration**
-- CRE workflows coordinate complex multi-step operations
-- Trigger-and-callback model simplifies business logic development
-- Stateless execution ensures deterministic and reproducible results
-- Automatic consensus for every capability invocation
-- Workflow DON monitors triggers and coordinates execution across Capability DONs
-
-### 6. **Flexible Collateral Mix**
-- Users can deposit any supported collateral
-- Dynamic collateral composition per user
-- Consistent pool ratios for all redemptions
-
-### 7. **Deposit Data Persistence & Audit Trail**
-- Contract stores all user deposits for transparency
-- Tracks collateral composition at deposit time
-- Historical records available for every transaction
-
-### 8. **Transparent & Fair Redemption**
-- Redemption based on transparent pool ratio calculation
-- Value-based redemption using consensus-verified pricing
-- No slippage on collateral mix - ratios strictly maintained
-- Fair to both original depositors and secondary market buyers
-
----
-
-## Example Scenario
-
-### User's Journey
-
-**Initial Holdings:**
-- 10 ETH @ $4,000 each = $40,000
-- 1 BTC @ $45,000 each = $45,000
-- 30 SOL @ $10 each = $300
-- 300 USDC @ $1 each = $300
-- **Total Value: $49,300**
-
-**Step 1: Supply Collaterals**
-```
-User selects all holdings to supply
-DApp sends to CRE: [10 ETH, 1 BTC, 30 SOL, 300 USDC]
-```
-
-**Step 2: CRE Calculation**
-```
-ETH: 10 * $4,000 = $40,000 (81.08%)
-BTC: 1 * $45,000 = $45,000 (91.26%)
-SOL: 30 * $10 = $300 (0.61%)
-USDC: 300 * $1 = $300 (0.61%)
-Total USD Value: $49,300
-Shares Minted: 49,300 SHARES (1:1 ratio with USD value)
-```
-
-**Step 3: Contract Execution**
-```
-- Update Global Pool State:
-  * totalCollateralBalance[ETH] += 10 ETH
-  * totalCollateralBalance[BTC] += 1 BTC
-  * totalCollateralBalance[SOL] += 30 SOL
-  * totalCollateralBalance[USDC] += 300 USDC
-  * totalSharesIssued += 49,300
-  * totalSharesOutstanding += 49,300
-
-- Transfer collaterals to contract:
-  * Transfer 10 ETH from User → Contract
-  * Transfer 1 BTC from User → Contract
-  * Transfer 30 SOL from User → Contract
-  * Transfer 300 USDC from User → Contract
-
-- Mint SHARES to User:
-  * Mint 49,300 SHARES to User wallet (ERC20 balance update)
-  * Shares are now fully transferrable
-
-- Save deposit history:
-  * Record this deposit for audit trail/transparency
-```
-
-**Step 4: User Transfers Some Shares (Optional)**
-```
-User A transfers 24,650 SHARES to User B
-
-Effects:
-- User A balance: 24,650 SHARES
-- User B balance: 24,650 SHARES
-- Global Pool State: UNCHANGED {10 ETH, 1 BTC, 30 SOL, 300 USDC}
-- Pool Ratios: UNCHANGED (2.028%, 91.275%, 0.608%, 0.608%)
-- Total Outstanding: 49,300
-```
-
-**Step 5: Later Redemption (6 months later) - By Any Share Holder**
-```
-Either User A or User B (or anyone holding the shares) redeems 24,650 SHARES
-
-Redemption calculation (using POOL RATIOS, not user-specific):
-
-For 24,650 SHARES (which is 50% of 49,300 total):
-  - ETH: (24,650 / 49,300) × 10 ETH = 5 ETH
-  - BTC: (24,650 / 49,300) × 1 BTC = 0.5 BTC
-  - SOL: (24,650 / 49,300) × 30 SOL = 15 SOL
-  - USDC: (24,650 / 49,300) × 300 USDC = 150 USDC
-
-Result:
-✓ If User A redeems: receives 5 ETH, 0.5 BTC, 15 SOL, 150 USDC
-✓ If User B redeems (after transfer): SAME - receives 5 ETH, 0.5 BTC, 15 SOL, 150 USDC
-✓ If User C bought shares from User B and redeems: SAME ratio
-
-The collateral mix is IDENTICAL regardless of who holds and redeems the shares!
-Prices may have changed, but the composition ratio stays the same.
-```
-
----
-
-## Contract Functions
-
-### MultiCollateralVault (key functions)
-
-This repository's vault implementation tracks immutable deposit batches and issues ERC20 shares tied to those batches. State-changing operations are intended to be driven by authenticated Chainlink CRE reports delivered via `ReceiverTemplate.onReport`. The primary externally-visible behaviors are:
-
-```solidity
-// ERC20 standard methods (inherited from ERC20)
-function transfer(address to, uint256 amount) external returns (bool)
-function approve(address spender, uint256 amount) external returns (bool)
-function transferFrom(address from, address to, uint256 amount) external returns (bool)
-function balanceOf(address user) external view returns (uint256)
-
-// Admin / view
-function addCollateral(IERC20 token) external onlyOwner
-function getSupportedCollaterals() external view returns (IERC20[] memory)
-function collateralCount() external view returns (uint256)
-function getCollateralBalance(address token) external view returns (uint256)
-
-// Batch & redemption helpers
-function getBatchDetails(uint256 batchId) public view returns (address[] memory collaterals, uint256[] memory amounts, uint256 shares, uint256 timestamp, address depositor)
-function getUserBatches(address user) public view returns (uint256[] memory)
-function previewBatchRedemption(uint256 batchId, uint256 sharesToBurn) public view returns (address[] memory collaterals, uint256[] memory amounts)
-
-// Note: `_depositCollaterals` and `_withdrawFromBatch` exist as internal hooks
-// and are invoked by `_processReport(bytes calldata report)`, which is called
-// by `ReceiverTemplate.onReport` after forwarder and metadata validation.
-```
-
-The contract exposes only view and admin methods publicly; deposits and redemptions are performed by trusted reports from CRE (see Chainlink CRE Integration section below).
-
----
-
-## Share Transferability & Redemption Guarantees
-
-### Original Deposit Ratio Preservation
-
-The Share Token is a standard **ERC20 token** with full transfer, trading, and liquidity pool capabilities. The crucial design principle ensures shares always redeem for their **original deposit composition**:
+### System Overview
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  ORIGINAL DEPOSIT RATIO GUARANTEE                            │
-├─────────────────────────────────────────────────────────────┤
-│                                                               │
-│  Redemption for shares = (Shares to Redeem / Deposit Shares) │
-│                        × (Original Depositor's Collaterals)  │
-│                                                               │
-│  This guarantee ensures:                                      │
-│  ✓ IDENTICAL redemption for original depositors             │
-│  ✓ IDENTICAL redemption for secondary market buyers         │
-│  ✓ IDENTICAL redemption for share recipients/gifted         │
-│  ✓ IMMUTABLE at deposit time                                │
-│  ✓ Immune to share trading, transfers, or pool changes      │
-│  ✓ Determined by original deposit, not aggregate pool       │
-│                                                               │
-└─────────────────────────────────────────────────────────────┘
+│         Chainlink Automation (CRE)                          │
+│   Consensus Layer - Orchestrates Deposits & Withdrawals    │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+                       │ Signed Reports
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│         ReceiverTemplate (Abstract)                         │
+│  • Validates forwarder address & workflow identity          │
+│  • Decodes metadata (workflowId, owner, name)               │
+│  • Routes to _processReport() implementation                │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+          ┌────────────┴────────────┐
+          ▼                         ▼
+    ┌──────────────┐         ┌──────────────┐
+    │ERC4626Multi  │         │Alternative   │
+    │Collateral    │         │1155Vault     │
+    │Vault (ERC20) │         │              │
+    │Share Tokens  │         │ERC1155 Share │
+    │              │         │TokenIds      │
+    └──────────────┘         └──────────────┘
+         │                        │
+         │ Holds                  │ Holds
+         ▼                        ▼
+    ┌──────────────────────────────────┐
+    │ ERC20 Collateral Tokens          │
+    │ (USDC, USDT, DAI, WETH, etc.)    │
+    └──────────────────────────────────┘
 ```
 
-### Who Can Redeem?
-
-- ✓ **Original depositors** - Can redeem shares they minted anytime
-- ✓ **Secondary market buyers** - Can redeem shares purchased on DEX
-- ✓ **Share recipients** - Can redeem shares received as gifts
-- ✓ **Anyone holding shares** - Full redemption rights for all holders
-
-### Redemption Ratio Examples
+### Contract Hierarchy
 
 ```
-EXAMPLE 1: Share Batch from Original Deposit
-  Original Deposit: {10 ETH, 1 BTC, 30 SOL, 300 USDC} → 49,300 SHARES
-  
-  User A redeems 4,930 SHARES (10% of batch):
-    - ETH: 10 × 10% = 1 ETH
-    - BTC: 1 × 10% = 0.1 BTC
-    - SOL: 30 × 10% = 3 SOL
-    - USDC: 300 × 10% = 30 USDC
-  
-═══════════════════════════════════════════════════════════════
-
-EXAMPLE 2: After Share Transfer
-  Original Deposit: {10 ETH, 1 BTC, 30 SOL, 300 USDC} → 49,300 SHARES
-  
-  User B (bought 4,930 shares from User A on Uniswap) redeems:
-  Receives: 1 ETH, 0.1 BTC, 3 SOL, 30 USDC ← SAME RATIO as User A!
-  
-  The original deposit composition is preserved!
-  
-═══════════════════════════════════════════════════════════════
-
-EXAMPLE 3: Multiple Deposits (Different Batches)
-  Batch A (from User A): {10 ETH, 1 BTC, 30 SOL, 300 USDC} → 49,300 SHARES
-  Batch B (from User C): {20 ETH, 5 BTC} → 200,000 SHARES
-  
-  User D (holding shares from Batch A) redeems 4,930:
-    Gets 10% of Batch A composition: 1 ETH, 0.1 BTC, 3 SOL, 30 USDC
-  
-  User E (holding shares from Batch B) redeems 20,000:
-    Gets 10% of Batch B composition: 2 ETH, 0.5 BTC
-  
-  Each batch maintains its own original ratios!
+                    IReceiver (interface)
+                          ▲
+                          │
+                    ReceiverTemplate
+                    (Abstract, Ownable)
+                          ▲
+         ┌────────────────┴──────────────────┐
+         │                                   │
+    MultiCollateralVault              Alternative1155Vault
+    (ERC20, Ownable, ReceiverTemplate) (ReceiverTemplate)
+         │                                   │
+         ├─ _depositCollaterals()           ├─ _depositCollaterals()
+         ├─ _withdrawFromBatch()            ├─ _withdrawFromTokenId()
+         ├─ _processReport()                ├─ ERC1155Shares (nested)
+         └─ Events & State                  └─ Events & State
 ```
 
-### Smart Contract Protection
+---
 
-The contract enforces original deposit ratio consistency:
+## Core Concepts
+
+### 1. Deposit Batches
+
+When a user deposits multiple ERC20 collaterals, a **DepositBatch** struct is created to permanently record:
 
 ```solidity
-// Each share batch stores original deposit data
-mapping(bytes32 => ShareBatch) depositBatches;
-
-struct ShareBatch {
-    address originalDepositor;        // Who created these shares
-    address[] originalCollaterals;    // What they deposited
-    uint256[] originalAmounts;        // How much of each
-    uint256 totalSharesIssued;        // Shares created for this batch
-    uint256 creationTime;             // When batch was created
+struct DepositBatch {
+    address[] collateralTokens;    // E.g., [USDC, WETH, DAI]
+    uint256[] collateralAmounts;   // E.g., [1000e6, 10e18, 500e18]
+    uint256 sharesMinted;          // Total shares issued for this batch
+    uint256 depositTimestamp;      // Immutable record of when deposited
+    address initiatingUser;        // Original depositor
 }
+```
 
-// When redeeming shares:
-function redeemShares(uint256 sharesToBurn, bytes32 batchId) {
-    ShareBatch memory batch = depositBatches[batchId];
-    
-    // Calculate redemption based on ORIGINAL ratio
-    for each collateral in batch.originalCollaterals {
-        uint256 amount = (sharesToBurn * batch.originalAmounts[i]) / batch.totalSharesIssued;
-        // Transfer amount to redeemer
-    }
-}
+### 2. Immutable Redemption Ratios
 
-// Result: Perfect proportional allocation based on ORIGINAL deposit
-// Not affected by other deposits, market activity, or caller's address
+Redemption is calculated **per batch** using the **original** collateral composition:
+
+```
+Redeemed Amount per Collateral = (SharesToBurn / BatchTotalShares) × OriginalAmount
+```
+
+**Example:**
+- Deposit batch: 1000 USDC + 10 WETH → 100 shares
+- User burns 50 shares → receives: 500 USDC + 5 WETH
+- This is true regardless of current vault balances or price movements
+
+### 3. Share Transfer Behavior
+
+- **ERC20 Variant**: Shares transfer like standard ERC20 tokens; recipient can redeem using any batch mixed with shares
+- **ERC1155 Variant**: Shares are tokenIds linked to specific batches; transfers are batch-aware
+
+---
+
+## Contract Variants
+
+### MultiCollateralVault (ERC20 Shares)
+
+**File**: `src/dependencies/MultiCollateralVault.sol`
+
+- Inherits from `ERC20` (`OpenZeppelin`)
+- Single unified share token symbol
+- Shares are transferrable like any ERC20
+- Best for: Simple, traditional multi-asset pools
+
+**Constructor**:
+```solidity
+constructor(string memory _name, string memory _symbol, address _trustedForwarder)
+```
+
+**Key Methods**:
+- `_depositCollaterals(address user, address[] collaterals, uint256[] amounts, uint256 sharesToMint)`
+- `_withdrawFromBatch(address user, uint256 batchId, uint256 sharesToBurn, address receiver)`
+- `getBatchDetails(uint256 batchId)` - View original deposit composition
+- `getUserBatches(address user)` - Get all batch IDs for a user
+
+---
+
+### Alternative1155Vault (ERC1155 Shares)
+
+**File**: `src/dependencies/alternative1155.sol`
+
+- Shares are **ERC1155 token IDs**, each mapped to a deposit batch
+- Includes nested `ERC1155Shares` contract (owned by vault)
+- Best for: NFT-like share ownership, batch-specific tracking
+
+**Constructor**:
+```solidity
+constructor(string memory _uri, address _trustedForwarder)
+```
+
+**Key Methods**:
+- `_depositCollaterals(address user, address[] collaterals, uint256[] amounts, uint256 sharesToMint)`
+- `_withdrawFromTokenId(address user, uint256 tokenId, uint256 sharesToBurn, address receiver)`
+- `shareToken` - Public reference to the `ERC1155Shares` contract
+
+---
+
+## Deposit Flow
+
+### Phase 1: Off-Chain (User → Chainlink CRE)
+
+```
+User (Wallet/DApp)
+    │
+    ├─ Approve collaterals to vault
+    │  (USDC.approve(vault, 1000e6))
+    │  (WETH.approve(vault, 10e18))
+    │
+    ├─ Submit deposit request to Chainlink CRE
+    │  (via Automation workflow)
+    │
+    └─ Wait for CRE consensus
+```
+
+### Phase 2: On-Chain (Vault Processing)
+
+```
+Chainlink Forwarder
+    │
+    ├─ Verify report signature & metadata
+    │  (workflowId, workflowOwner, workflowName)
+    │
+    ▼
+ReceiverTemplate.onReport()
+    │
+    ├─ Security checks (forwarder, author, workflow name)
+    │
+    ▼
+Vault._processReport()
+    │
+    ├─ Decode tokenId from report[0:32]
+    │  (tokenId == 0 means deposit)
+    │
+    ├─ Decode (user, collaterals[], amounts[], sharesToMint)
+    │
+    ├─ Call _validateDeposit() hook (user-customizable)
+    │
+    ▼
+_depositCollaterals()
+    │
+    ├─ Loop through collaterals:
+    │  │
+    │  ├─ Transfer collateral from user to vault
+    │  │  (IERC20(token).safeTransferFrom(user, vault, amount))
+    │  │
+    │  └─ Update collateralBalance[token] += amount
+    │
+    ├─ Create/store DepositBatch
+    │
+    ├─ Record batch ID for user
+    │  (userBatches[user].push(batchId))
+    │
+    ├─ Mint shares to user
+    │  (ERC20: _mint(user, sharesToMint))
+    │  (ERC1155: shareToken.mint(user, batchId, sharesToMint))
+    │
+    └─ Emit DepositProcessed event
+```
+
+### Detailed Flow Diagram (ERC20)
+
+```
+START: _depositCollaterals()
+  │
+  ├─ Validate inputs
+  │  ├─ user != address(0) ✓
+  │  ├─ collaterals.length == amounts.length ✓
+  │  ├─ At least 1 collateral ✓
+  │  └─ sharesToMint > 0 ✓
+  │
+  ├─ LOOP: Transfer collaterals
+  │  │
+  │  ├─ [i=0] USDC: safeTransferFrom(user, vault, 1000e6)
+  │  │   └─ collateralBalance[USDC] += 1000e6
+  │  │
+  │  ├─ [i=1] WETH: safeTransferFrom(user, vault, 10e18)
+  │  │   └─ collateralBalance[WETH] += 10e18
+  │  │
+  │  └─ [i=2] DAI: safeTransferFrom(user, vault, 500e18)
+  │      └─ collateralBalance[DAI] += 500e18
+  │
+  ├─ Create DepositBatch(id=1)
+  │  ├─ collateralTokens = [USDC, WETH, DAI]
+  │  ├─ collateralAmounts = [1000e6, 10e18, 500e18]
+  │  ├─ sharesMinted = 100
+  │  ├─ depositTimestamp = block.timestamp
+  │  └─ initiatingUser = user
+  │
+  ├─ userBatches[user].push(1)
+  │
+  ├─ _mint(user, 100)
+  │  └─ User's ERC20 balance += 100
+  │
+  ├─ totalSharesIssued += 100
+  │
+  ├─ Emit DepositProcessed(user, 1, [USDC, WETH, DAI], [1000e6, 10e18, 500e18], 100)
+  │
+  └─ RETURN batchId=1
+
+END
 ```
 
 ---
 
-## Benefits
+## Withdrawal Flow
 
-| Benefit | Description |
-|---------|-------------|
-| **Unified Exposure** | Single token representing diverse collateral basket |
-| **Consensus-Verified Pricing** | CRE ensures accurate USD-based pricing via BFT consensus |
-| **Flexibility** | Users can supply any mix of supported collaterals |
-| **Cross-Chain** | Omnichain compatibility via CRE workflow orchestration |
-| **Transparent** | All deposit and redemption data stored on-chain |
-| **Decentralized** | No single points of failure - multiple independent nodes verify operations |
-| **Preservation** | Original collateral ratios maintained for redemptions |
+### Phase 1: Off-Chain (User → Chainlink CRE)
+
+```
+User (Wallet/DApp)
+    │
+    ├─ Select batch ID to redeem from
+    │  (e.g., batchId = 1)
+    │
+    ├─ Specify shares to burn
+    │  (e.g., 50 shares)
+    │
+    ├─ Submit withdrawal request
+    │
+    └─ Wait for CRE consensus
+```
+
+### Phase 2: On-Chain (Vault Processing)
+
+```
+Chainlink Forwarder
+    │
+    ├─ Verify report
+    │
+    ▼
+ReceiverTemplate.onReport()
+    │
+    ├─ Security checks
+    │
+    ▼
+Vault._processReport()
+    │
+    ├─ Decode tokenId from report[0:32]
+    │  (tokenId != 0 means withdrawal)
+    │
+    ├─ Decode (user, sharesToBurn, receiver)
+    │
+    ├─ Call _validateWithdrawal() hook
+    │
+    ▼
+_withdrawFromBatch() / _withdrawFromTokenId()
+    │
+    ├─ Verify user has enough shares
+    │
+    ├─ Load batch from storage
+    │
+    ├─ Calculate redemption amounts (per collateral):
+    │  │
+    │  └─ For each collateral[i]:
+    │     amount[i] = (sharesToBurn / batchTotalShares) × originalAmount[i]
+    │
+    ├─ Burn shares from user
+    │
+    ├─ Transfer collaterals to receiver
+    │
+    ├─ Update collateralBalance
+    │
+    └─ Emit WithdrawalProcessed event
+```
+
+### Detailed Flow Diagram (Withdrawal)
+
+```
+START: _withdrawFromBatch(user=0xABC..., batchId=1, sharesToBurn=50, receiver=0xXYZ...)
+  │
+  ├─ Validate inputs
+  │  ├─ user != address(0) ✓
+  │  ├─ receiver != address(0) ✓
+  │  ├─ sharesToBurn > 0 ✓
+  │  └─ user.balance[shares] >= 50 ✓
+  │
+  ├─ Load batch 1 from storage
+  │  └─ collaterals = [USDC, WETH, DAI]
+  │     amounts = [1000e6, 10e18, 500e18]
+  │     sharesMinted = 100
+  │
+  ├─ LOOP: Calculate redemption amounts
+  │  │
+  │  ├─ [i=0] USDC: (50 / 100) × 1000e6 = 500e6
+  │  │
+  │  ├─ [i=1] WETH: (50 / 100) × 10e18 = 5e18
+  │  │
+  │  └─ [i=2] DAI: (50 / 100) × 500e18 = 250e18
+  │
+  ├─ _burn(user, 50)
+  │  └─ User's ERC20 balance -= 50
+  │
+  ├─ LOOP: Transfer collaterals to receiver
+  │  │
+  │  ├─ [i=0] USDC.safeTransfer(receiver, 500e6)
+  │  │   └─ collateralBalance[USDC] -= 500e6
+  │  │
+  │  ├─ [i=1] WETH.safeTransfer(receiver, 5e18)
+  │  │   └─ collateralBalance[WETH] -= 5e18
+  │  │
+  │  └─ [i=2] DAI.safeTransfer(receiver, 250e18)
+  │      └─ collateralBalance[DAI] -= 250e18
+  │
+  ├─ Emit WithdrawalProcessed(user, 50, [USDC, WETH, DAI], [500e6, 5e18, 250e18])
+  │
+  └─ RETURN ([USDC, WETH, DAI], [500e6, 5e18, 250e18])
+
+END
+```
 
 ---
 
-## Risk Considerations
+## Integration with Chainlink CRE
 
-1. **Data Source Quality**: Relies on quality of underlying data sources that CRE's Capability DONs aggregate
-2. **Collateral Volatility**: Users exposed to collateral price changes between deposit and redemption
-3. **Smart Contract Risk**: Potential bugs in Share Token contract or CRE workflow logic
-4. **Consensus Delays**: BFT consensus aggregation may introduce minor execution delays
-5. **Multi-Chain Bridges**: Bridge security for omnichain token transfers
-6. **CRE Early Access**: Chainlink Runtime Environment is in Early Access development phase
+### Report Format
+
+All vault operations are triggered via **Chainlink CRE reports**. The vault's `_processReport()` method decodes reports in the following format:
+
+#### Deposit Report
+```solidity
+// abi.encode(uint256(0), address user, address[] collaterals, uint256[] amounts, uint256 sharesToMint)
+// First 32 bytes (tokenId = 0) signals DEPOSIT operation
+```
+
+#### Withdrawal Report
+```solidity
+// abi.encode(uint256(batchId), address user, uint256 sharesToBurn, address receiver)
+// First 32 bytes (tokenId != 0) signals WITHDRAWAL operation for that batch/tokenId
+```
+
+### Metadata Structure
+
+Chainlink Forwarder provides metadata for verification:
+
+```solidity
+struct Metadata {
+    bytes32 workflowId;      // Unique workflow identifier
+    bytes10 workflowName;    // Workflow name (40-bit truncated for gas)
+    address workflowOwner;   // Workflow author (CRE operator)
+}
+```
+
+The vault validates:
+1. **Forwarder**: Only accept reports from configured Chainlink Forwarder
+2. **Workflow ID**: Optional verification of specific workflow
+3. **Workflow Owner**: Optional verification of operator identity
+4. **Workflow Name**: Optional name check (requires owner validation)
+
+### Setup Chainlink CRE Integration
+
+```solidity
+// During deployment
+vault = new MultiCollateralVault("Unified Share", "USHARE", 0xChainlinkForwarderAddress);
+
+// Post-deployment: configure workflow expectations
+vault.setExpectedAuthor(0xWorkflowOwnerAddress);
+vault.setExpectedWorkflowId(0xWorkflowIdBytes32);
+vault.setExpectedWorkflowName("my-workflow");
+```
 
 ---
 
-## Conclusion
+## Setup & Installation
 
-The Unified Share Token protocol provides a seamless way for users to create a diversified collateral portfolio through a single token. By leveraging **Chainlink CRE (Chainlink Runtime Environment)** as the orchestration layer, the system achieves:
+### Prerequisites
 
-- **Decentralized Consensus**: Every price feed and calculation is verified by multiple independent nodes via Byzantine Fault Tolerant consensus
-- **Cross-Chain Coordination**: CRE workflows seamlessly orchestrate operations across multiple blockchains
-- **Institutional-Grade Security**: Built-in security guarantees inherited from distributed consensus computing
-- **Fair & Transparent**: On-chain records and consensus-verified pricing ensure complete transparency and eliminate single points of failure
+- **Solidity**: 0.8.20+
+- **Foundry**: Latest version
+- **Node.js**: 18+
+- **Dependencies**: OpenZeppelin Contracts v5.5.0, Forge Std
 
-This architecture transforms collateral management from a centralized oracle model to a fully decentralized, consensus-verified system suitable for institutional-grade smart contracts.
+### Installation
+
+```bash
+# Clone repository
+git clone https://github.com/yourusername/chainlink_cre_unified_shares.git
+cd chainlink_cre_unified_shares
+
+# Install dependencies
+forge install
+
+# Build contracts
+forge build
+
+# Run tests (if available)
+forge test -vv
+```
+
+### Project Structure
+
+```
+chainlink_cre_unified_shares/
+├── src/
+│   ├── Vault.sol                      # Main entry point
+│   ├── dependencies/
+│   │   ├── MultiCollateralVault.sol   # ERC20-based shares
+│   │   ├── Alternative1155Vault.sol   # ERC1155-based shares
+│   │   ├── Receiver.sol               # CRE report receiver
+│   │   ├── Receiver.sol               # User helper contract
+│   │   └── MultiCollateralVaultAlt.sol # Alternative implementation
+│   └── interfaces/
+│       └── IReceiver.sol               # CRE receiver interface
+├── lib/
+│   ├── forge-std/                     # Foundry standard library
+│   └── openzeppelin-contracts/        # OpenZeppelin Contracts
+├── test/                              # Test files (if any)
+├── foundry.toml                       # Foundry configuration
+└── README.md                          # This file
+```
+
+---
+
+## Usage Guide
+
+### 1. Deploy a MultiCollateralVault (ERC20 Shares)
+
+```solidity
+pragma solidity ^0.8.20;
+import {MultiCollateralVault} from "./src/dependencies/MultiCollateralVault.sol";
+
+contract MyVault is MultiCollateralVault {
+    constructor(address _trustedForwarder)
+        MultiCollateralVault("Unified Share", "USHARE", _trustedForwarder)
+    {}
+}
+```
+
+**Deployment:**
+```bash
+forge create src/MyVault.sol:MyVault \
+  --constructor-args 0xChainlinkForwarderAddress \
+  --rpc-url $RPC_URL \
+  --private-key $PRIVATE_KEY
+```
+
+### 2. Deploy an Alternative1155Vault (ERC1155 Shares)
+
+```solidity
+pragma solidity ^0.8.20;
+import {Alternative1155Vault} from "./src/dependencies/alternative1155.sol";
+
+contract MyNFTVault is Alternative1155Vault {
+    constructor(address _trustedForwarder)
+        Alternative1155Vault("https://api.example.com/metadata/", _trustedForwarder)
+    {}
+}
+```
+
+### 3. Configure Vault
+
+```solidity
+// As owner (typically CRE operator)
+
+// Add supported collateral tokens
+vault.addCollateral(IERC20(0xUSDC));
+vault.addCollateral(IERC20(0xWETH));
+vault.addCollateral(IERC20(0xDAI));
+
+// Configure Chainlink CRE validation
+vault.setExpectedAuthor(0xCREOperatorAddress);
+vault.setExpectedWorkflowId(0xYourWorkflowId);
+```
+
+### 4. User Deposits (Off-Chain)
+
+```javascript
+// User-side (e.g., smart contract or DApp)
+
+const deposit = {
+  user: "0xUserAddress",
+  collaterals: ["0xUSDC", "0xWETH", "0xDAI"],
+  amounts: ["1000e6", "10e18", "500e18"],
+  sharesToMint: "100e18"
+};
+
+// Send to Chainlink CRE workflow
+// CRE will aggregate reports and trigger vault._processReport()
+```
+
+### 5. Query Vault State
+
+```solidity
+// View user's batches
+uint256[] memory batchIds = vault.getUserBatches(userAddress);
+
+// Get batch details
+(
+  address[] memory collaterals,
+  uint256[] memory amounts,
+  uint256 shares,
+  uint256 timestamp,
+  address depositor
+) = vault.getBatchDetails(batchId);
+
+// Preview redemption
+(
+  address[] memory redeemCollaterals,
+  uint256[] memory redeemAmounts
+) = vault.previewBatchRedemption(batchId, sharesToBurn);
+
+// Check collateral balance
+uint256 usdcBalance = vault.getCollateralBalance(USDC);
+```
+
+---
+
+## API Reference
+
+### MultiCollateralVault
+
+#### State Variables
+
+| Name | Type | Visibility | Description |
+|------|------|------------|-------------|
+| `collateralBalance` | `mapping(address => uint256)` | public | Total held per collateral token |
+| `depositBatches` | `mapping(uint256 => DepositBatch)` | public | Batch storage by ID |
+| `batchCounter` | `uint256` | public | Next batch ID |
+| `userBatches` | `mapping(address => uint256[])` | public | Batches per user |
+| `totalSharesIssued` | `uint256` | public | Cumulative shares minted |
+| `supportedCollaterals` | `IERC20[]` | public | List of allowed tokens |
+
+#### Functions
+
+##### `addCollateral(IERC20 _token)`
+- **Access**: `onlyOwner`
+- **Purpose**: Register new collateral token
+- **Emits**: `CollateralAdded`
+
+##### `_depositCollaterals(address user, address[] collaterals, uint256[] amounts, uint256 sharesToMint)`
+- **Access**: `internal virtual`
+- **Purpose**: Process deposit (called by CRE)
+- **Returns**: `batchId`
+
+##### `_withdrawFromBatch(address user, uint256 batchId, uint256 sharesToBurn, address receiver)`
+- **Access**: `internal virtual`
+- **Purpose**: Process withdrawal (called by CRE)
+- **Returns**: `(collaterals, amounts)`
+
+##### `getBatchDetails(uint256 batchId)`
+- **Access**: `public view`
+- **Returns**: `(collaterals[], amounts[], shares, timestamp, depositor)`
+
+##### `getUserBatches(address user)`
+- **Access**: `public view`
+- **Returns**: `batchId[]`
+
+##### `previewBatchRedemption(uint256 batchId, uint256 sharesToBurn)`
+- **Access**: `public view`
+- **Returns**: `(collaterals[], amounts[])`
+
+##### `_validateDeposit(address[] collaterals, uint256[] amounts, uint256 sharesToMint)`
+- **Access**: `internal view virtual`
+- **Purpose**: Override for custom deposit validation
+
+##### `_validateWithdrawal(address user, uint256 batchId, uint256 sharesToBurn)`
+- **Access**: `internal view virtual`
+- **Purpose**: Override for custom withdrawal validation
+
+---
+
+### Alternative1155Vault
+
+Same as MultiCollateralVault, with these differences:
+
+#### State Variables
+
+| Name | Type | Visibility | Description |
+|------|------|------------|-------------|
+| `shareToken` | `ERC1155Shares` | public | ERC1155 share token contract |
+
+#### Functions
+
+Identical to `MultiCollateralVault`, except:
+- Batches identified by **tokenId** instead of `batchId`
+- Share operations use `shareToken.mint()` / `burn()` / `balanceOf()`
+- Method names: `_withdrawFromTokenId()` instead of `_withdrawFromBatch()`
+
+---
+
+## Security Considerations
+
+### 1. **Immutable Ratios**
+Once a batch is created, collateral ratios are permanently locked. This prevents:
+- Liquidity attacks
+- Flash loan exploits
+- Price oracle manipulation
+
+### 2. **Access Control**
+- Only the **owner** (typically CRE operator) can call deposit/withdrawal
+- All state-changing operations validated through `ReceiverTemplate`
+- Chainlink Forwarder signature verification mandatory
+
+### 3. **SafeERC20 Usage**
+All token transfers use OpenZeppelin's `SafeERC20` to handle:
+- Non-standard ERC20 implementations
+- Revert-on-failure detection
+- Return value validation
+
+### 4. **Reentrancy Protection**
+- External calls to ERC20 tokens are made after state updates
+- ERC4626-inspired design minimizes reentrancy surface
+
+### 5. **Input Validation**
+- Array length mismatches caught with `require()`
+- Zero addresses rejected
+- Zero amounts rejected
+- Batch IDs validated before use
+
+### 6. **Audit Recommendations**
+- Consider formal verification for immutable ratio calculations
+- Audit `ReceiverTemplate` CRE integration thoroughly
+- Test extensively with large collateral arrays (gas limits)
+- Validate Chainlink Forwarder address configuration post-deployment
+
+---
+
+## Events
+
+### DepositProcessed
+```solidity
+event DepositProcessed(
+    address indexed user,
+    uint256 indexed batchId,        // or tokenId for ERC1155
+    address[] collaterals,
+    uint256[] amounts,
+    uint256 sharesIssued
+);
+```
+
+### WithdrawalProcessed
+```solidity
+event WithdrawalProcessed(
+    address indexed user,
+    uint256 shares,                 // or sharesiBurned
+    address[] collaterals,
+    uint256[] amounts
+);
+```
+
+### CollateralAdded
+```solidity
+event CollateralAdded(address indexed token);
+```
+
+---
+
+## Examples
+
+### Example 1: 3-Collateral Deposit (ERC20)
+
+**Scenario**: User deposits 1000 USDC + 10 WETH + 500 DAI
+
+```
+Initial State:
+  - User USDC balance: 1000e6
+  - User WETH balance: 10e18
+  - User DAI balance: 500e18
+
+Deposit Request:
+  {
+    user: "0xAlice",
+    collaterals: ["0xUSDC", "0xWETH", "0xDAI"],
+    amounts: ["1000e6", "10e18", "500e18"],
+    sharesToMint: "100e18"
+  }
+
+After Deposit (via CRE):
+  - Batch #1 created:
+    * collaterals = [USDC, WETH, DAI]
+    * amounts = [1000e6, 10e18, 500e18]
+    * sharesMinted = 100
+    * timestamp = block.timestamp
+    * initiatingUser = 0xAlice
+
+  - State Updates:
+    * vault.collateralBalance[USDC] += 1000e6
+    * vault.collateralBalance[WETH] += 10e18
+    * vault.collateralBalance[DAI] += 500e18
+    * Alice's share balance += 100
+
+Future Redemption (50 shares):
+  - USDC redeemed: (50 / 100) × 1000e6 = 500e6
+  - WETH redeemed: (50 / 100) × 10e18 = 5e18
+  - DAI redeemed: (50 / 100) × 500e18 = 250e18
+  
+  Regardless of current vault ratios!
+```
+
+### Example 2: ERC1155 Batch Management
+
+```solidity
+// Deposit creates tokenId = 1
+vault._depositCollaterals(..);  // mints 100 shares of tokenId 1
+
+// User can hold multiple batches
+vault._depositCollaterals(..);  // mints 50 shares of tokenId 2
+vault._depositCollaterals(..);  // mints 75 shares of tokenId 3
+
+// User's ERC1155 balances:
+// - tokenId 1: 100 shares
+// - tokenId 2: 50 shares
+// - tokenId 3: 75 shares
+
+// Query user's tokenIds:
+uint256[] memory tokenIds = vault.getUserBatches(user);
+// Returns: [1, 2, 3]
+```
+
+---
+
+## Contributing
+
+Contributions are welcome! Please:
+
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
+
+---
+
+## License
+
+This project is licensed under the **MIT License** — see the LICENSE file for details.
+
+---
+
+## Support
+
+For questions or issues:
+
+- **GitHub Issues**: Open an issue on the repository
+- **Email**: Contact the maintainers
+- **Discussions**: Use GitHub Discussions for questions
+
+---
+
+## Acknowledgments
+
+- **OpenZeppelin Contracts**: ERC20, ERC1155, Ownable implementations
+- **Chainlink Automation**: CRE infrastructure and Forwarder contract
+- **Foundry**: Development and testing framework
+- **Solmate**: Gas-optimized reference patterns
+
+---
+
+**Last Updated**: February 2026  
+**Version**: 1.0.0
