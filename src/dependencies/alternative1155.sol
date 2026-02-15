@@ -50,13 +50,10 @@ abstract contract Alternative1155Vault is ReceiverTemplate {
 
     /// @dev Tracks collateral holdings in the vault: tokenAddress => totalAmount
     mapping(address => uint256) public collateralBalance;
-a
+
     /// @dev Stores deposit batches by tokenId (share id)
     mapping(uint256 => DepositBatch) public depositBatches;
     uint256 public tokenCounter = 1;
-
-    /// @dev Maps user address to their tokenIds for historical tracking
-    mapping(address => uint256[]) public userBatches;
 
     /// @dev Total shares ever issued across all tokenIds
     uint256 public totalSharesIssued = 0;
@@ -142,8 +139,6 @@ a
         batch.sharesMinted = _sharesToMint;
         batch.depositTimestamp = block.timestamp;
         batch.initiatingUser = _user;
-
-        userBatches[_user].push(tokenId);
 
         // Mint ERC1155 share tokens for this deposit batch (external share contract)
         shareToken.mint(_user, tokenId, _sharesToMint);
@@ -252,10 +247,6 @@ a
             batch.depositTimestamp,
             batch.initiatingUser
         );
-    }
-
-    function getUserBatches(address _user) public view returns (uint256[] memory) {
-        return userBatches[_user];
     }
 
     function previewBatchRedemption(uint256 _tokenId, uint256 _sharesToBurn)
