@@ -150,6 +150,55 @@ abstract contract Alternative1155Vault is ReceiverTemplate {
         return tokenId;
     }
 
+    /**
+     * @dev Allow the batch initiator to deposit additional collateral to an existing batch
+     * while maintaining the original collateral ratios. CRE calculates the shares offchain.
+     * @param _user recipient of minted shares
+     * @param _tokenId The share token ID (batch ID) to deposit into
+     * @param _collaterals array of ERC20 token addresses
+     * @param _amounts Array of additional amounts per collateral
+     * @param _sharesToMint amount of share tokens to mint (calculated by CRE)
+     */
+    function _depositToExistingBatch(
+        address _user,
+        uint256 _tokenId,
+        address[] memory _collaterals,
+        uint256[] memory _amounts,
+        uint256 _sharesToMint
+    ) internal virtual {
+        require(_user != address(0), "Invalid user address");
+        require(_sharesToMint > 0, "Shares must be greater than 0");
+
+        DepositBatch storage batch = depositBatches[_tokenId];
+
+        require(batch.sharesMinted > 0, "Invalid tokenId - batch does not exist");
+        require(_user == batch.initiatingUser, "Only batch initiator can deposit to existing batch");
+        require(_collaterals.length == _amounts.length, "Array length mismatch");
+        require(_collaterals.length == batch.collateralTokens.length, "Array length mismatch with batch collaterals");
+
+        uint256 collateralLength = _collaterals.length;
+
+        // Transfer ERC20 collaterals from user to vault
+        for (uint256 i = 0; i < collateralLength; ++i) {
+            require(_amounts[i] > 0, "Amount must be greater than 0");
+            require(_collaterals[i] == batch.collateralTokens[i], "Collateral token mismatch");
+            IERC20(_collaterals[i]).safeTransferFrom(_user, address(this), _amounts[i]);
+            collateralBalance[_collaterals[i]] += _amounts[i];
+
+            // Update batch with new accumulated amounts
+            batch.collateralAmounts[i] += _amounts[i];
+        }
+
+        // Update batch shares and emit event
+        batch.sharesMinted += _sharesToMint;
+        totalSharesIssued += _sharesToMint;
+
+        // Mint new ERC1155 share tokens
+        shareToken.mint(_user, _tokenId, _sharesToMint);
+
+        emit DepositProcessed(_user, _tokenId, _collaterals, _amounts, _sharesToMint);
+    }
+
     /*//////////////////////////////////////////////////////////////
                     WITHDRAWAL LOGIC (Called by CRE)
     //////////////////////////////////////////////////////////////*/
@@ -181,6 +230,9 @@ abstract contract Alternative1155Vault is ReceiverTemplate {
         // Burn ERC1155 share tokens from user (via share contract)
         shareToken.burn(_user, _tokenId, _sharesToBurn);
 
+        // Deduct shares from batch
+        batch.sharesMinted -= _sharesToBurn;
+
         // Transfer ERC20 collaterals to receiver
         for (uint256 i = 0; i < collateralLength; ++i) {
             IERC20(collaterals[i]).safeTransfer(_receiver, amounts[i]);
@@ -199,24 +251,34 @@ abstract contract Alternative1155Vault is ReceiverTemplate {
                     CRE REPORT PROCESSING
     //////////////////////////////////////////////////////////////*/
 
-    /// Report format for deposit:
-    /// abi.encode(uint256(0), address user, address[] collaterals, uint256[] ids, uint256[] amounts, uint256 sharesToMint)
-    /// Report format for redeem:
-    /// abi.encode(uint256(batchId), address user, uint256 sharesToBurn, address receiver)
+    /// Report format for new batch deposit (isDeposit=true, tokenId=0):
+    /// abi.encode(true, uint256(0), address user, address[] collaterals, uint256[] amounts, uint256 sharesToMint)
+    /// Report format for deposit to existing batch (isDeposit=true, tokenId>0):
+    /// abi.encode(true, uint256(tokenId), address user, address[] collaterals, uint256[] amounts, uint256 sharesToMint)
+    /// Report format for withdrawal (isDeposit=false, tokenId>0):
+    /// abi.encode(false, uint256(tokenId), address user, uint256 sharesToBurn, address receiver)
     function _processReport(bytes calldata report) internal virtual override {
-        require(report.length >= 32, "Empty report");
+        require(report.length >= 64, "Report too short");
 
-        uint256 tokenId = abi.decode(report[0:32], (uint256));
+        (bool isDeposit, uint256 tokenId) = abi.decode(report[0:64], (bool, uint256));
 
-        if (tokenId == 0) {
-            ( , address user, address[] memory collaterals, uint256[] memory amounts, uint256 sharesToMint) = abi.decode(report, (uint256, address, address[], uint256[], uint256));
+        if (isDeposit) {
+            // Deposit operations (new batch or existing batch)
+            ( , , address user, address[] memory collaterals, uint256[] memory amounts, uint256 sharesToMint) = abi.decode(report, (bool, uint256, address, address[], uint256[], uint256));
             _validateDeposit(collaterals, amounts, sharesToMint);
-            _depositCollaterals(user, collaterals, amounts, sharesToMint);
-            return;
+
+            if (tokenId == 0) {
+                // New batch deposit
+                _depositCollaterals(user, collaterals, amounts, sharesToMint);
+            } else {
+                // Deposit to existing batch
+                _depositToExistingBatch(user, tokenId, collaterals, amounts, sharesToMint);
+            }
         } else {
-            ( , address user2, uint256 sharesToBurn, address receiver) = abi.decode(report, (uint256, address, uint256, address));
-            _validateWithdrawal(user2, tokenId, sharesToBurn);
-            _withdrawFromTokenId(user2, tokenId, sharesToBurn, receiver);
+            // Withdrawal
+            ( , , address user, uint256 sharesToBurn, address receiver) = abi.decode(report, (bool, uint256, address, uint256, address));
+            _validateWithdrawal(user, tokenId, sharesToBurn);
+            _withdrawFromTokenId(user, tokenId, sharesToBurn, receiver);
         }
     }
 
@@ -267,6 +329,28 @@ abstract contract Alternative1155Vault is ReceiverTemplate {
         }
 
         return (collaterals, amounts);
+    }
+
+    /**
+     * @dev Preview the shares that would be minted for a deposit to an existing batch
+     * @param _tokenId The batch token ID
+     * @param _amounts Array of deposit amounts per collateral
+     * @return sharesToMint Amount of shares that would be minted
+     */
+    function previewDepositToExistingBatch(uint256 _tokenId, uint256[] memory _amounts)
+        public
+        view
+        returns (uint256 sharesToMint)
+    {
+        DepositBatch storage batch = depositBatches[_tokenId];
+        require(batch.sharesMinted > 0, "Invalid tokenId - batch does not exist");
+        require(_amounts.length == batch.collateralTokens.length, "Array length mismatch with batch collaterals");
+        require(_amounts[0] > 0, "Amount must be greater than 0");
+
+        // Calculate shares based on the ratio of new deposit to original deposit
+        sharesToMint = (_amounts[0] * batch.sharesMinted) / batch.collateralAmounts[0];
+
+        return sharesToMint;
     }
 
     /*//////////////////////////////////////////////////////////////

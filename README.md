@@ -398,18 +398,122 @@ END
 
 ### Report Format
 
-All vault operations are triggered via **Chainlink CRE reports**. The vault's `_processReport()` method decodes reports in the following format:
+All vault operations are triggered via **Chainlink CRE reports**. The vault's `_processReport()` method decodes reports using a **boolean flag** to determine the operation type.
 
-#### Deposit Report
+#### Report Structure
 ```solidity
-// abi.encode(uint256(0), address user, address[] collaterals, uint256[] amounts, uint256 sharesToMint)
-// First 32 bytes (tokenId = 0) signals DEPOSIT operation
+// All reports include: isDeposit (bool), tokenId (uint256), and operation-specific parameters
+```
+
+#### New Batch Deposit Report
+```solidity
+// isDeposit = true, tokenId = 0
+// abi.encode(true, uint256(0), address user, address[] collaterals, uint256[] amounts, uint256 sharesToMint)
+```
+
+#### Deposit to Existing Batch Report
+```solidity
+// isDeposit = true, tokenId > 0
+// abi.encode(true, uint256(tokenId), address user, address[] collaterals, uint256[] amounts, uint256 sharesToMint)
 ```
 
 #### Withdrawal Report
 ```solidity
-// abi.encode(uint256(batchId), address user, uint256 sharesToBurn, address receiver)
-// First 32 bytes (tokenId != 0) signals WITHDRAWAL operation for that batch/tokenId
+// isDeposit = false, tokenId > 0
+// abi.encode(false, uint256(tokenId), address user, uint256 sharesToBurn, address receiver)
+```
+
+### Report Encoding Examples (TypeScript/ethers.js)
+
+#### New Batch Deposit
+```typescript
+import { ethers } from 'ethers';
+
+function encodeNewBatchDeposit(
+  user: string,
+  collaterals: string[],
+  amounts: bigint[],
+  sharesToMint: bigint
+): string {
+  const abiCoder = ethers.AbiCoder.defaultAbiCoder();
+  return abiCoder.encode(
+    ['bool', 'uint256', 'address', 'address[]', 'uint256[]', 'uint256'],
+    [true, 0n, user, collaterals, amounts, sharesToMint]
+  );
+}
+
+// Example usage:
+const report = encodeNewBatchDeposit(
+  '0x1234567890123456789012345678901234567890',
+  ['0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2'],
+  [ethers.parseUnits('1000', 6), ethers.parseUnits('10', 18)],
+  ethers.parseUnits('100', 18)
+);
+```
+
+#### Deposit to Existing Batch
+```typescript
+function encodeDepositToExistingBatch(
+  tokenId: bigint,
+  user: string,
+  collaterals: string[],
+  amounts: bigint[],
+  sharesToMint: bigint
+): string {
+  const abiCoder = ethers.AbiCoder.defaultAbiCoder();
+  return abiCoder.encode(
+    ['bool', 'uint256', 'address', 'address[]', 'uint256[]', 'uint256'],
+    [true, tokenId, user, collaterals, amounts, sharesToMint]
+  );
+}
+
+// Example usage - deposit to batch 2 with same ratio:
+const report = encodeDepositToExistingBatch(
+  2n,
+  '0x1234567890123456789012345678901234567890',
+  ['0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2'],
+  [ethers.parseUnits('1000', 6), ethers.parseUnits('10', 18)],
+  ethers.parseUnits('100', 18)
+);
+```
+
+#### Withdrawal
+```typescript
+function encodeWithdrawal(
+  tokenId: bigint,
+  user: string,
+  sharesToBurn: bigint,
+  receiver: string
+): string {
+  const abiCoder = ethers.AbiCoder.defaultAbiCoder();
+  return abiCoder.encode(
+    ['bool', 'uint256', 'address', 'uint256', 'address'],
+    [false, tokenId, user, sharesToBurn, receiver]
+  );
+}
+
+// Example usage - withdraw from batch 2:
+const report = encodeWithdrawal(
+  2n,
+  '0x1234567890123456789012345678901234567890',
+  ethers.parseUnits('50', 18),
+  '0x0987654321098765432109876543210987654321'
+);
+```
+
+### Report Processing Logic
+
+The `_processReport()` function determines the operation as follows:
+
+```
+┌─ Check isDeposit flag
+├─ TRUE (deposit operations)
+│  ├─ Check tokenId
+│  ├─ tokenId == 0 → New batch deposit (creates new batch)
+│  └─ tokenId > 0 → Deposit to existing batch
+│
+└─ FALSE (withdrawal)
+   └─ tokenId > 0 → Withdraw from batch
 ```
 
 ### Metadata Structure
