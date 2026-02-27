@@ -179,6 +179,61 @@ constructor(string memory _uri, address _trustedForwarder)
 
 ---
 
+### TokenizerFactory (Multi-Vault ERC20 Shares Factory)
+
+**File**: `src/dependencies/TokenizerFactory.sol`
+
+- **Factory Pattern**: Users deploy multiple independent collateralized ERC20 vaults
+- Each vault has its own `CollateralBase` share token and custom collateral pools
+- Uses **action codes (uint8)** to determine CRE operations
+- Best for: Decentralized share creation, multi-pool management
+
+**Constructor**:
+```solidity
+constructor(address _trustedForwarder)
+```
+
+**Key Features**:
+- Users deploy their own share tokens with custom collaterals
+- Action codes (uint8):
+  - `0`: Mint Shares (create new batch deposit)
+  - `1`: Deposit Existing (add collateral to existing batch)
+  - `2`: Redeem Shares (burn shares and withdraw collateral)
+- Batch-based tracking with immutable redemption ratios
+- CRE fully controls all operations
+
+**Key Methods**:
+- `deployTokenizer(string name, string symbol, address[] collaterals)` - Deploy new vault
+- `addCollateral(uint256 vaultId, address collateral)` - Add supported collateral
+- `_mintShares(uint256 vaultId, address user, address[] collaterals, uint256[] amounts, uint256 sharesToMint)` - Create new batch
+- `_depositToExisting(uint256 vaultId, uint256 batchId, address user, address[] collaterals, uint256[] amounts, uint256 sharesToMint)` - Add to existing batch
+- `_redeemShares(uint256 vaultId, uint256 batchId, address user, uint256 sharesToBurn, address receiver)` - Burn and withdraw
+- `getBatchDetails(uint256 vaultId, uint256 batchId)` - View batch composition
+- `previewRedemption(uint256 vaultId, uint256 batchId, uint256 sharesToBurn)` - Preview collateral return
+- `getUserTokenizers(address user)` - Get user's deployed vaults
+
+**CRE Report Format**:
+
+#### Mint Shares (Action Code 0)
+```solidity
+// Create new batch and mint shares
+abi.encode(uint256 vaultId, uint8(0), address user, address[] collaterals, uint256[] amounts, uint256 sharesToMint)
+```
+
+#### Deposit Existing (Action Code 1)
+```solidity
+// Deposit to existing batch maintaining original ratio
+abi.encode(uint256 vaultId, uint8(1), uint256 batchId, address user, address[] collaterals, uint256[] amounts, uint256 sharesToMint)
+```
+
+#### Redeem Shares (Action Code 2)
+```solidity
+// Burn shares and withdraw collateral
+abi.encode(uint256 vaultId, uint8(2), uint256 batchId, address user, uint256 sharesToBurn, address receiver)
+```
+
+---
+
 ## Deposit Flow
 
 ### Phase 1: Off-Chain (User → Chainlink CRE)
@@ -495,6 +550,88 @@ function encodeWithdrawal(
 // Example usage - withdraw from batch 2:
 const report = encodeWithdrawal(
   2n,
+  '0x1234567890123456789012345678901234567890',
+  ethers.parseUnits('50', 18),
+  '0x0987654321098765432109876543210987654321'
+);
+```
+
+#### TokenizerFactory Report Encoding (Action Code Pattern)
+
+TokenizerFactory uses action codes (uint8) to determine operations: `0` = MintShares, `1` = DepositExisting, `2` = RedeemShares
+
+```typescript
+// ===== TOKENIZER FACTORY ENCODINGS =====
+
+// Action Code 0: Mint Shares (create new batch)
+function encodeTokenizerMintShares(
+  vaultId: bigint,
+  user: string,
+  collaterals: string[],
+  amounts: bigint[],
+  sharesToMint: bigint
+): string {
+  const abiCoder = ethers.AbiCoder.defaultAbiCoder();
+  return abiCoder.encode(
+    ['uint256', 'uint8', 'address', 'address[]', 'uint256[]', 'uint256'],
+    [vaultId, 0, user, collaterals, amounts, sharesToMint]
+  );
+}
+
+// Example: Deploy vault, then mint shares
+const mintReport = encodeTokenizerMintShares(
+  1n, // vaultId
+  '0x1234567890123456789012345678901234567890',
+  ['0xUsdc', '0xWeth'],
+  [ethers.parseUnits('1000', 6), ethers.parseUnits('5', 18)],
+  ethers.parseUnits('100', 18)
+);
+
+// Action Code 1: Deposit to Existing Batch
+function encodeTokenizerDepositExisting(
+  vaultId: bigint,
+  batchId: bigint,
+  user: string,
+  collaterals: string[],
+  amounts: bigint[],
+  sharesToMint: bigint
+): string {
+  const abiCoder = ethers.AbiCoder.defaultAbiCoder();
+  return abiCoder.encode(
+    ['uint256', 'uint8', 'uint256', 'address', 'address[]', 'uint256[]', 'uint256'],
+    [vaultId, 1, batchId, user, collaterals, amounts, sharesToMint]
+  );
+}
+
+// Example: Deposit more to existing batch maintaining ratio
+const depositExistingReport = encodeTokenizerDepositExisting(
+  1n, // vaultId
+  1n, // batchId
+  '0x1234567890123456789012345678901234567890',
+  ['0xUsdc', '0xWeth'],
+  [ethers.parseUnits('1000', 6), ethers.parseUnits('5', 18)],
+  ethers.parseUnits('100', 18)
+);
+
+// Action Code 2: Redeem Shares
+function encodeTokenizerRedeemShares(
+  vaultId: bigint,
+  batchId: bigint,
+  user: string,
+  sharesToBurn: bigint,
+  receiver: string
+): string {
+  const abiCoder = ethers.AbiCoder.defaultAbiCoder();
+  return abiCoder.encode(
+    ['uint256', 'uint8', 'uint256', 'address', 'uint256', 'address'],
+    [vaultId, 2, batchId, user, sharesToBurn, receiver]
+  );
+}
+
+// Example: Withdraw from batch
+const redeemReport = encodeTokenizerRedeemShares(
+  1n, // vaultId
+  1n, // batchId
   '0x1234567890123456789012345678901234567890',
   ethers.parseUnits('50', 18),
   '0x0987654321098765432109876543210987654321'

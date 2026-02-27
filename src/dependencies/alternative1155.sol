@@ -30,7 +30,7 @@ contract ERC1155Shares is ERC1155, Ownable {
     }
 }
 
-abstract contract Alternative1155Vault is ReceiverTemplate {
+abstract contract Alternative1155Vault {
     using Math for uint256;
     using SafeERC20 for IERC20;
 
@@ -40,7 +40,7 @@ abstract contract Alternative1155Vault is ReceiverTemplate {
                             TYPES & STATE
     //////////////////////////////////////////////////////////////*/
 
-    struct DepositBatch {
+    struct DepositBatch1155 {
         address[] collateralTokens;      // List of collateral ERC20 token addresses
         uint256[] collateralAmounts;     // Original amounts deposited
         uint256 sharesMinted;            // Total shares issued for this tokenId
@@ -52,7 +52,7 @@ abstract contract Alternative1155Vault is ReceiverTemplate {
     mapping(address => uint256) public collateralBalance;
 
     /// @dev Stores deposit batches by tokenId (share id)
-    mapping(uint256 => DepositBatch) public depositBatches;
+    mapping(uint256 => DepositBatch1155) public depositBatches;
     uint256 public tokenCounter = 1;
 
     /// @dev Total shares ever issued across all tokenIds
@@ -84,9 +84,8 @@ abstract contract Alternative1155Vault is ReceiverTemplate {
 
     /// @param _uri ERC1155 metadata URI (can be empty)
     constructor(
-        string memory _uri,
-        address _trustedForwarder
-    ) ReceiverTemplate(_trustedForwarder) {
+        string memory _uri
+    ) {
         shareToken = new ERC1155Shares(_uri);
     }
 
@@ -133,7 +132,7 @@ abstract contract Alternative1155Vault is ReceiverTemplate {
         }
 
         tokenId = tokenCounter;
-        DepositBatch storage batch = depositBatches[tokenId];
+        DepositBatch1155 storage batch = depositBatches[tokenId];
         batch.collateralTokens = _collaterals;
         batch.collateralAmounts = _amounts;
         batch.sharesMinted = _sharesToMint;
@@ -169,7 +168,7 @@ abstract contract Alternative1155Vault is ReceiverTemplate {
         require(_user != address(0), "Invalid user address");
         require(_sharesToMint > 0, "Shares must be greater than 0");
 
-        DepositBatch storage batch = depositBatches[_tokenId];
+        DepositBatch1155 storage batch = depositBatches[_tokenId];
 
         require(batch.sharesMinted > 0, "Invalid tokenId - batch does not exist");
         require(_user == batch.initiatingUser, "Only batch initiator can deposit to existing batch");
@@ -214,7 +213,7 @@ abstract contract Alternative1155Vault is ReceiverTemplate {
         require(_sharesToBurn > 0, "Burn amount must be greater than 0");
         require(shareToken.balanceOf(_user, _tokenId) >= _sharesToBurn, "Insufficient share balance");
 
-        DepositBatch storage batch = depositBatches[_tokenId];
+        DepositBatch1155 storage batch = depositBatches[_tokenId];
         require(batch.sharesMinted > 0, "Invalid tokenId");
 
         uint256 collateralLength = batch.collateralTokens.length;
@@ -257,6 +256,9 @@ abstract contract Alternative1155Vault is ReceiverTemplate {
     /// abi.encode(true, uint256(tokenId), address user, address[] collaterals, uint256[] amounts, uint256 sharesToMint)
     /// Report format for withdrawal (isDeposit=false, tokenId>0):
     /// abi.encode(false, uint256(tokenId), address user, uint256 sharesToBurn, address receiver)
+
+
+/*
     function _processReport(bytes calldata report) internal virtual override {
         require(report.length >= 64, "Report too short");
 
@@ -281,7 +283,7 @@ abstract contract Alternative1155Vault is ReceiverTemplate {
             _withdrawFromTokenId(user, tokenId, sharesToBurn, receiver);
         }
     }
-
+*/
     /*//////////////////////////////////////////////////////////////
                         ACCOUNTING LOGIC
     //////////////////////////////////////////////////////////////*/
@@ -301,7 +303,7 @@ abstract contract Alternative1155Vault is ReceiverTemplate {
             address depositor
         )
     {
-        DepositBatch storage batch = depositBatches[_tokenId];
+        DepositBatch1155 storage batch = depositBatches[_tokenId];
         return (
             batch.collateralTokens,
             batch.collateralAmounts,
@@ -316,7 +318,7 @@ abstract contract Alternative1155Vault is ReceiverTemplate {
         view
         returns (address[] memory collaterals, uint256[] memory amounts)
     {
-        DepositBatch storage batch = depositBatches[_tokenId];
+        DepositBatch1155 storage batch = depositBatches[_tokenId];
         require(batch.sharesMinted > 0, "Invalid tokenId");
 
         uint256 collateralLength = batch.collateralTokens.length;
@@ -342,7 +344,7 @@ abstract contract Alternative1155Vault is ReceiverTemplate {
         view
         returns (uint256 sharesToMint)
     {
-        DepositBatch storage batch = depositBatches[_tokenId];
+        DepositBatch1155 storage batch = depositBatches[_tokenId];
         require(batch.sharesMinted > 0, "Invalid tokenId - batch does not exist");
         require(_amounts.length == batch.collateralTokens.length, "Array length mismatch with batch collaterals");
         require(_amounts[0] > 0, "Amount must be greater than 0");
@@ -357,13 +359,13 @@ abstract contract Alternative1155Vault is ReceiverTemplate {
                         OVERRIDE HOOKS
     //////////////////////////////////////////////////////////////*/
 
-    function _validateDeposit(
+    function _validateDepositERC1155(
         address[] memory _collaterals,
         uint256[] memory _amounts,
         uint256 _sharesToMint
     ) internal view virtual {}
 
-    function _validateWithdrawal(address _user, uint256 _tokenId, uint256 _sharesToBurn)
+    function _validateWithdrawalERC1155(address _user, uint256 _tokenId, uint256 _sharesToBurn)
         internal
         view
         virtual
