@@ -6,6 +6,7 @@ import {ReceiverTemplate} from "./dependencies/Receiver.sol";
 
 contract Vault is Alternative1155Vault,TokenizerFactory,ReceiverTemplate{
 
+    address public stakeCa;
     // Action codes 20
     uint8 constant ACTION_MINT_SHARES_ERC20 = 0;
     uint8 constant ACTION_DEPOSIT_EXISTING_ERC20 = 1;
@@ -24,8 +25,20 @@ contract Vault is Alternative1155Vault,TokenizerFactory,ReceiverTemplate{
     {
 
     }
+    /*
+    modifier onlyStakeCa(){
+        require(msg.sender == stakeCa);
+        _;
+    }
 
+    function setStakeCa(address _stakeCa) external onlyOwner {
+        stakeCa = _stakeCa;
+    }
 
+    function withdrawCollaterals(address[] memory _collaterals , uint256[] memory _amounts , address _reciever) external onlyStakeCa {
+
+    }
+    */
     function _processReport(bytes calldata report) internal virtual override {
         require(report.length >= 32, "Report too short");
         (uint8 _actionCode) = abi.decode(report[0:32], (uint8));
