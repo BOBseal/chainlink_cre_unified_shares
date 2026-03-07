@@ -103,11 +103,12 @@ contract TokenizerFactory {
      * @return vaultId The ID of the deployed tokenizer
      * @return shareToken The address of the deployed share token
      */
-    function deployTokenizer(
+    function _deployTokenizer(
         string memory _name,
         string memory _symbol,
-        address[] memory _collaterals
-    ) external returns (uint256 vaultId, address shareToken) {
+        address[] memory _collaterals,
+        address _deployer
+    ) internal returns (uint256 vaultId, address shareToken) {
         require(_collaterals.length > 0, "Must add at least one collateral");
         require(bytes(_name).length > 0, "Name cannot be empty");
         require(bytes(_symbol).length > 0, "Symbol cannot be empty");
@@ -121,7 +122,7 @@ contract TokenizerFactory {
         // Initialize vault
         TokenizerVault storage vault = tokenizers[vaultId];
         vault.shareToken = shareToken;
-        vault.deployer = msg.sender;
+        vault.deployer = _deployer;
         vault.supportedCollaterals = _collaterals;
         vault.totalSharesIssued = 0;
         vault.isActive = true;

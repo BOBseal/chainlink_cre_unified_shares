@@ -9,7 +9,7 @@ contract Vault is Alternative1155Vault,TokenizerFactory,ReceiverTemplate{
     address public stakeCa;
     // Action codes 20
     uint8 constant ACTION_MINT_SHARES_ERC20 = 0;
-    uint8 constant ACTION_DEPOSIT_EXISTING_ERC20 = 1;
+    uint8 constant ACTION_DEPLOY_ERC20 = 1;
     uint8 constant ACTION_REDEEM_SHARES_ERC20 = 2;
     // Action codes 1155
     uint8 constant ACTION_MINT_SHARES_1155 = 3;
@@ -49,6 +49,14 @@ contract Vault is Alternative1155Vault,TokenizerFactory,ReceiverTemplate{
                 abi.decode(report, ( uint8, uint256, address, address[], uint256[], uint256));
             // TokenizerFactory expects the deployer as `user` and performs the collateral transfer
             _depositAndMintShares(vaultId, user, collaterals, amounts, sharesToMint);
+        }
+
+        if(_actionCode == ACTION_DEPLOY_ERC20){
+            // report layout: [vaultId, actionCode, user, collaterals[], amounts[], sharesToMint]
+            ( ,string memory name, string memory symbol, address[] memory collaterals, address user) = 
+                abi.decode(report, ( uint8, string, string, address[], address));
+            // TokenizerFactory expects the deployer as `user` and performs the collateral transfer
+            _deployTokenizer(name, symbol, collaterals, user);
         }
 
         if(_actionCode == ACTION_REDEEM_SHARES_ERC20){
