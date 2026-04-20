@@ -9,26 +9,17 @@ import {CSE721} from "../src/CSE721.sol";
 import {CSE1155} from "../src/CSE1155.sol";
 
 contract Deploy is Script {
-    function run() external {
-        address trustedForwarder = vm.envAddress("TRUSTED_FORWARD");
-        require(trustedForwarder != address(0), "TRUSTED_FORWARD env required");
+    function run() external { 
+        ////// SEPOLIA CONFIGURATION - UPDATE FOR OTHER NETWORKS //////
+        address trustedForwarder = 0x15fC6ae953E024d975e77382eEeC56A9101f9F88;
+        uint256 deployerKey = vm.envUint("PRIVATE_KEY");
+        string memory cse721Name = "Share Token 721";
 
-        string memory cse721Name = vm.envString("CSE721_NAME");
-        if (bytes(cse721Name).length == 0) {
-            cse721Name = "CSE721 Share Token";
-        }
+        string memory cse721Symbol = "SHARE721";
 
-        string memory cse721Symbol = vm.envString("CSE721_SYMBOL");
-        if (bytes(cse721Symbol).length == 0) {
-            cse721Symbol = "CSE721";
-        }
+        string memory cse1155Uri = "0x00";
 
-        string memory cse1155Uri = vm.envString("CSE1155_URI");
-        if (bytes(cse1155Uri).length == 0) {
-            cse1155Uri = "https://example.com/metadata/{id}.json";
-        }
-
-        vm.startBroadcast();
+        vm.startBroadcast(deployerKey);
 
         VaultCore core = new VaultCore();
         CSE20 cse20 = new CSE20(trustedForwarder, address(core));
