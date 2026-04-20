@@ -482,120 +482,77 @@ END
 
 ## Integration with Chainlink CRE
 
-### Report Format
+The CSE contracts are designed to work seamlessly with Chainlink Runtime Environment (CRE) for automated deposit and withdrawal operations. Each CSE contract inherits from `ReceiverTemplate` and implements `_processReport()` to handle CRE-triggered operations.
 
-All vault operations are triggered via **Chainlink CRE reports**. The vault's `_processReport()` method decodes reports using a **boolean flag** to determine the operation type.
+### RWA Token Contracts
 
-#### Report Structure
-```solidity
-// All reports include: isDeposit (bool), tokenId (uint256), and operation-specific parameters
-```
+The system uses specialized RWA (Real World Asset) token contracts that implement the **IERC-7943** standard, providing regulatory compliance features:
 
-#### New Batch Deposit Report
-```solidity
-// isDeposit = true, tokenId = 0
-// abi.encode(true, uint256(0), address user, address[] collaterals, uint256[] amounts, uint256 sharesToMint)
-```
+#### uRWA20 (ERC-20 RWA Tokens)
+- **File**: `src/rwa/uRWA20.sol`
+- **Standard**: IERC-7943 Fungible
+- **Features**: Whitelisting, token freezing, forced transfers
+- **Roles**: Admin, Minter, Burner, Freezer, Whitelist, Force Transfer
+- **Used by**: CSE20 for share tokenization
 
-#### Deposit to Existing Batch Report
-```solidity
-// isDeposit = true, tokenId > 0
-// abi.encode(true, uint256(tokenId), address user, address[] collaterals, uint256[] amounts, uint256 sharesToMint)
-```
+#### uRWA721 (ERC-721 RWA Tokens)
+- **File**: `src/rwa/uRWA721.sol`
+- **Standard**: IERC-7943 Non-Fungible
+- **Features**: Whitelisting, token freezing, forced transfers
+- **Roles**: Admin, Minter, Burner, Freezer, Whitelist, Force Transfer
+- **Used by**: CSE721 for share tokenization
 
-#### Withdrawal Report
-```solidity
-// isDeposit = false, tokenId > 0
-// abi.encode(false, uint256(tokenId), address user, uint256 sharesToBurn, address receiver)
-```
+#### uRWA1155 (ERC-1155 RWA Tokens)
+- **File**: `src/rwa/uRWA1155.sol`
+- **Standard**: IERC-7943 Multi-Token
+- **Features**: Whitelisting, token freezing, forced transfers
+- **Roles**: Admin, Minter, Burner, Freezer, Whitelist, Force Transfer
+- **Used by**: CSE1155 for share tokenization
+
+### CRE Report Processing
+
+Each CSE contract processes CRE reports through the `_processReport()` method. Reports are encoded with action codes and parameters:
+
+#### CSE20 Action Codes
+- **Action 1**: Deploy Tokenizer (create new ERC20 share vault)
+- **Action 2**: Deposit (mint shares via VaultCore)
+- **Action 3**: Withdraw (burn shares and redeem collateral)
+- **Action 4**: Operator Call (role changes on RWA tokens)
+- **Action 5**: Document Action (add/update/remove documents)
+
+#### CSE721 Action Codes
+- **Action 1**: Deposit Mint (create new ERC721 token)
+- **Action 2**: Withdraw (burn token and redeem collateral)
+- **Action 3**: Operator Call (role changes on RWA tokens)
+- **Action 4**: Document Action (add/update/remove documents)
+
+#### CSE1155 Action Codes
+- **Action 1**: Deposit Mint (mint ERC1155 shares)
+- **Action 2**: Deposit Existing (add to existing batch)
+- **Action 3**: Withdraw (burn shares and redeem collateral)
+- **Action 4**: Operator Call (role changes on RWA tokens)
+- **Action 5**: Document Action (add/update/remove documents)
 
 ### Report Encoding Examples (TypeScript/ethers.js)
 
-#### New Batch Deposit
+#### CSE20: Deploy Tokenizer
 ```typescript
-import { ethers } from 'ethers';
-
-function encodeNewBatchDeposit(
-  user: string,
-  collaterals: string[],
-  amounts: bigint[],
-  sharesToMint: bigint
+function encodeCSE20DeployTokenizer(
+  name: string,
+  symbol: string,
+  collaterals: string[]
 ): string {
   const abiCoder = ethers.AbiCoder.defaultAbiCoder();
   return abiCoder.encode(
-    ['bool', 'uint256', 'address', 'address[]', 'uint256[]', 'uint256'],
-    [true, 0n, user, collaterals, amounts, sharesToMint]
+    ['uint8', 'string', 'string', 'address[]'],
+    [1, name, symbol, collaterals]
   );
 }
-
-// Example usage:
-const report = encodeNewBatchDeposit(
-  '0x1234567890123456789012345678901234567890',
-  ['0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2'],
-  [ethers.parseUnits('1000', 6), ethers.parseUnits('10', 18)],
-  ethers.parseUnits('100', 18)
-);
 ```
 
-#### Deposit to Existing Batch
+#### CSE20: Deposit (Mint Shares)
 ```typescript
-function encodeDepositToExistingBatch(
-  tokenId: bigint,
-  user: string,
-  collaterals: string[],
-  amounts: bigint[],
-  sharesToMint: bigint
-): string {
-  const abiCoder = ethers.AbiCoder.defaultAbiCoder();
-  return abiCoder.encode(
-    ['bool', 'uint256', 'address', 'address[]', 'uint256[]', 'uint256'],
-    [true, tokenId, user, collaterals, amounts, sharesToMint]
-  );
-}
-
-// Example usage - deposit to batch 2 with same ratio:
-const report = encodeDepositToExistingBatch(
-  2n,
-  '0x1234567890123456789012345678901234567890',
-  ['0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2'],
-  [ethers.parseUnits('1000', 6), ethers.parseUnits('10', 18)],
-  ethers.parseUnits('100', 18)
-);
-```
-
-#### Withdrawal
-```typescript
-function encodeWithdrawal(
-  tokenId: bigint,
-  user: string,
-  sharesToBurn: bigint,
-  receiver: string
-): string {
-  const abiCoder = ethers.AbiCoder.defaultAbiCoder();
-  return abiCoder.encode(
-    ['bool', 'uint256', 'address', 'uint256', 'address'],
-    [false, tokenId, user, sharesToBurn, receiver]
-  );
-}
-
-// Example usage - withdraw from batch 2:
-const report = encodeWithdrawal(
-  2n,
-  '0x1234567890123456789012345678901234567890',
-  ethers.parseUnits('50', 18),
-  '0x0987654321098765432109876543210987654321'
-);
-```
-
-#### TokenizerFactory Report Encoding (Action Code Pattern)
-
-TokenizerFactory uses action codes (uint8) to determine operations: `0` = MintShares, `1` = DepositExisting, `2` = RedeemShares
-
-```typescript
-// ===== TOKENIZER FACTORY ENCODINGS =====
-
-// Action Code 0: Mint Shares (create new batch)
-function encodeTokenizerMintShares(
+function encodeCSE20Deposit(
   vaultId: bigint,
   user: string,
   collaterals: string[],
@@ -604,24 +561,30 @@ function encodeTokenizerMintShares(
 ): string {
   const abiCoder = ethers.AbiCoder.defaultAbiCoder();
   return abiCoder.encode(
-    ['uint256', 'uint8', 'address', 'address[]', 'uint256[]', 'uint256'],
-    [vaultId, 0, user, collaterals, amounts, sharesToMint]
+    ['uint8', 'uint256', 'address', 'address[]', 'uint256[]', 'uint256'],
+    [2, vaultId, user, collaterals, amounts, sharesToMint]
   );
 }
+```
 
-// Example: Deploy vault, then mint shares
-const mintReport = encodeTokenizerMintShares(
-  1n, // vaultId
-  '0x1234567890123456789012345678901234567890',
-  ['0xUsdc', '0xWeth'],
-  [ethers.parseUnits('1000', 6), ethers.parseUnits('5', 18)],
-  ethers.parseUnits('100', 18)
-);
+#### CSE721: Deposit Mint
+```typescript
+function encodeCSE721DepositMint(
+  user: string,
+  collaterals: string[],
+  amounts: bigint[]
+): string {
+  const abiCoder = ethers.AbiCoder.defaultAbiCoder();
+  return abiCoder.encode(
+    ['uint8', 'address', 'address[]', 'uint256[]'],
+    [1, user, collaterals, amounts]
+  );
+}
+```
 
-// Action Code 1: Deposit to Existing Batch
-function encodeTokenizerDepositExisting(
-  vaultId: bigint,
-  batchId: bigint,
+#### CSE1155: Deposit Mint
+```typescript
+function encodeCSE1155DepositMint(
   user: string,
   collaterals: string[],
   amounts: bigint[],
@@ -629,90 +592,91 @@ function encodeTokenizerDepositExisting(
 ): string {
   const abiCoder = ethers.AbiCoder.defaultAbiCoder();
   return abiCoder.encode(
-    ['uint256', 'uint8', 'uint256', 'address', 'address[]', 'uint256[]', 'uint256'],
-    [vaultId, 1, batchId, user, collaterals, amounts, sharesToMint]
+    ['uint8', 'address', 'address[]', 'uint256[]', 'uint256'],
+    [1, user, collaterals, amounts, sharesToMint]
   );
 }
-
-// Example: Deposit more to existing batch maintaining ratio
-const depositExistingReport = encodeTokenizerDepositExisting(
-  1n, // vaultId
-  1n, // batchId
-  '0x1234567890123456789012345678901234567890',
-  ['0xUsdc', '0xWeth'],
-  [ethers.parseUnits('1000', 6), ethers.parseUnits('5', 18)],
-  ethers.parseUnits('100', 18)
-);
-
-// Action Code 2: Redeem Shares
-function encodeTokenizerRedeemShares(
-  vaultId: bigint,
-  batchId: bigint,
-  user: string,
-  sharesToBurn: bigint,
-  receiver: string
-): string {
-  const abiCoder = ethers.AbiCoder.defaultAbiCoder();
-  return abiCoder.encode(
-    ['uint256', 'uint8', 'uint256', 'address', 'uint256', 'address'],
-    [vaultId, 2, batchId, user, sharesToBurn, receiver]
-  );
-}
-
-// Example: Withdraw from batch
-const redeemReport = encodeTokenizerRedeemShares(
-  1n, // vaultId
-  1n, // batchId
-  '0x1234567890123456789012345678901234567890',
-  ethers.parseUnits('50', 18),
-  '0x0987654321098765432109876543210987654321'
-);
 ```
 
-### Report Processing Logic
+### CRE Workflow Integration
 
-The `_processReport()` function determines the operation as follows:
+1. **User Request**: User submits deposit/withdrawal request to CRE workflow
+2. **CRE Validation**: CRE validates request and aggregates oracle reports
+3. **Report Generation**: CRE encodes operation parameters into report
+4. **Forwarder Call**: CRE calls CSE contract via trusted forwarder
+5. **Processing**: CSE contract validates and executes operation
+6. **Asset Movement**: VaultCore handles collateral transfers
+7. **Token Minting/Burning**: RWA token contracts mint/burn shares
 
-```
-┌─ Check isDeposit flag
-├─ TRUE (deposit operations)
-│  ├─ Check tokenId
-│  ├─ tokenId == 0 → New batch deposit (creates new batch)
-│  └─ tokenId > 0 → Deposit to existing batch
-│
-└─ FALSE (withdrawal)
-   └─ tokenId > 0 → Withdraw from batch
-```
+### Security Features
 
-### Metadata Structure
+- **Forwarder Verification**: Only accepts calls from configured Chainlink forwarder
+- **Action Code Validation**: Ensures operation type is valid
+- **Access Control**: RWA tokens use role-based permissions
+- **Immutable Ratios**: Deposit ratios locked at creation time
+- **Whitelist Enforcement**: RWA tokens can restrict transfers to compliant addresses
+- **Freeze Capability**: Tokens can be frozen for regulatory compliance
 
-Chainlink Forwarder provides metadata for verification:
+---
 
+## RWA Token Features (IERC-7943)
+
+The share tokens implement the **IERC-7943** standard for Real World Assets, providing enterprise-grade compliance features:
+
+### Core RWA Features
+
+✅ **Whitelisting**: Restrict token transfers to approved addresses only  
+✅ **Token Freezing**: Temporarily lock tokens for compliance reasons  
+✅ **Forced Transfers**: Regulatory seizure capabilities  
+✅ **Role-Based Access**: Granular permissions for different operations  
+✅ **Event Logging**: Comprehensive audit trail for all operations  
+
+### Access Control Roles
+
+| Role | Description | Permissions |
+|------|-------------|-------------|
+| **DEFAULT_ADMIN_ROLE** | Contract administration | Grant/revoke all roles |
+| **MINTER_ROLE** | Token creation | Mint new tokens |
+| **BURNER_ROLE** | Token destruction | Burn existing tokens |
+| **FREEZING_ROLE** | Compliance freezing | Freeze/unfreeze tokens |
+| **WHITELIST_ROLE** | Address management | Add/remove whitelisted addresses |
+| **FORCE_TRANSFER_ROLE** | Regulatory actions | Force transfer frozen tokens |
+
+### Compliance Functions
+
+#### Whitelist Management
 ```solidity
-struct Metadata {
-    bytes32 workflowId;      // Unique workflow identifier
-    bytes10 workflowName;    // Workflow name (40-bit truncated for gas)
-    address workflowOwner;   // Workflow author (CRE operator)
-}
+// Add address to whitelist
+rwaToken.setWhitelist(account, true);
+
+// Check whitelist status
+bool allowed = rwaToken.canTransact(account);
 ```
 
-The vault validates:
-1. **Forwarder**: Only accept reports from configured Chainlink Forwarder
-2. **Workflow ID**: Optional verification of specific workflow
-3. **Workflow Owner**: Optional verification of operator identity
-4. **Workflow Name**: Optional name check (requires owner validation)
-
-### Setup Chainlink CRE Integration
-
+#### Token Freezing
 ```solidity
-// During deployment
-vault = new MultiCollateralVault("Unified Share", "USHARE", 0xChainlinkForwarderAddress);
+// Freeze tokens (ERC20)
+rwaToken.setFrozenTokens(account, amount);
 
-// Post-deployment: configure workflow expectations
-vault.setExpectedAuthor(0xWorkflowOwnerAddress);
-vault.setExpectedWorkflowId(0xWorkflowIdBytes32);
-vault.setExpectedWorkflowName("my-workflow");
+// Freeze specific token (ERC721)
+rwaToken.setFrozenToken(account, tokenId, true);
+
+// Check frozen status
+uint256 frozen = rwaToken.getFrozenTokens(account);
 ```
+
+#### Forced Transfers
+```solidity
+// Regulatory seizure (requires FORCE_TRANSFER_ROLE)
+bool success = rwaToken.forcedTransfer(from, to, amount);
+```
+
+### Integration with CSE Contracts
+
+- **CSE20**: Deploys uRWA20 tokens for each tokenizer vault
+- **CSE721**: Deploys uRWA721 tokens for unique share ownership
+- **CSE1155**: Deploys uRWA1155 tokens for batch-based shares
+- **Operator Calls**: CSE contracts can execute role changes and compliance actions via CRE reports
 
 ---
 
@@ -751,16 +715,22 @@ chainlink_cre_unified_shares/
 │   ├── CSE721.sol                     # ERC721 share tokenization
 │   ├── CSE1155.sol                    # ERC1155 share tokenization
 │   ├── vaultcore/
-│   │   └── core.sol                   # Central asset holder
+│   │   └── core.sol                   # Central asset holder (VaultCore)
 │   ├── dependencies/
 │   │   ├── Receiver.sol               # CRE report receiver template
 │   │   └── IReceiver.sol              # CRE receiver interface
 │   └── rwa/
-│       ├── uRWA20.sol                 # ERC20 RWA token implementation
-│       ├── uRWA721.sol                # ERC721 RWA token implementation
-│       └── uRWA1155.sol               # ERC1155 RWA token implementation
+│       ├── uRWA20.sol                 # ERC20 RWA token (IERC-7943 compliant)
+│       ├── uRWA721.sol                # ERC721 RWA token (IERC-7943 compliant)
+│       ├── uRWA1155.sol               # ERC1155 RWA token (IERC-7943 compliant)
+│       ├── interfaces/
+│       │   └── IERC7943.sol           # RWA token standard interface
+│       ├── modules/                   # Modular RWA token components
+│       │   ├── erc20/                 # ERC20 RWA modules
+│       │   └── erc1155/               # ERC1155 RWA modules
+│       └── mocks/                     # Mock contracts for testing
 ├── script/
-│   └── Deploy.s.sol                   # Deployment script
+│   └── Deploy.s.sol                   # Deployment script for all contracts
 ├── lib/
 │   ├── forge-std/                     # Foundry standard library
 │   └── openzeppelin-contracts/        # OpenZeppelin Contracts
