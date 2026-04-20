@@ -1,6 +1,6 @@
 # Chainlink CRE Unified Shares Vault
 
-A sophisticated multi-collateral vault system for managing unified share tokens with Chainlink Automation integration. This repository implements two vault architectures: **ERC20-based shares** (`MultiCollateralVault`) and **ERC1155-based shares** (`Alternative1155Vault`).
+A sophisticated multi-collateral vault system for managing unified share tokens with Chainlink Automation integration. This repository implements multiple vault architectures: **ERC20-based shares** (`CSE20`), **ERC721-based shares** (`CSE721`), and **ERC1155-based shares** (`CSE1155`), all backed by a central `VaultCore` contract.
 
 ## 📋 Table of Contents
 
@@ -8,6 +8,7 @@ A sophisticated multi-collateral vault system for managing unified share tokens 
 - [Architecture](#architecture)
 - [Core Concepts](#core-concepts)
 - [Contract Variants](#contract-variants)
+- [Deployment](#deployment)
 - [Deposit Flow](#deposit-flow)
 - [Withdrawal Flow](#withdrawal-flow)
 - [Integration with Chainlink CRE](#integration-with-chainlink-cre)
@@ -22,12 +23,14 @@ A sophisticated multi-collateral vault system for managing unified share tokens 
 
 This project provides a **multi-collateral vault system** that enables:
 
-- **Unified Share Tokens**: Accept deposits in multiple ERC20 collateral tokens and issue a single unified share token
+- **Unified Share Tokens**: Accept deposits in multiple ERC20 collateral tokens and issue unified share tokens in ERC20, ERC721, or ERC1155 standards
 - **Immutable Redemption Ratios**: Lock the original collateral composition at deposit time — redemptions always use the original ratio, regardless of current pool state
 - **Chainlink CRE Integration**: Automated deposit and withdrawal orchestration via Chainlink Automation (formerly Keeper Network) with the Chainlink Runtime Environment
-- **Two Token Standards**:
-  - `MultiCollateralVault`: ERC20 shares (transferrable like standard tokens)
-  - `Alternative1155Vault`: ERC1155 shares (batch-aware, per-tokenId tracking)
+- **Three Token Standards**:
+  - `CSE20`: ERC20 shares (transferrable like standard tokens)
+  - `CSE721`: ERC721 shares (NFT-like, unique token per deposit)
+  - `CSE1155`: ERC1155 shares (batch-aware, semi-fungible tokens)
+- **Centralized Asset Management**: All assets are held in `VaultCore`, with CSE contracts managing tokenization
 
 ### Key Features
 
@@ -37,6 +40,7 @@ This project provides a **multi-collateral vault system** that enables:
 ✅ **Chainlink CRE integration** for trustless automation  
 ✅ **Per-user batch tracking** to avoid expensive loops  
 ✅ **Gas-optimized** mappings & nested structures  
+✅ **Modular architecture** with separate tokenization contracts  
 
 ---
 
@@ -59,22 +63,27 @@ This project provides a **multi-collateral vault system** that enables:
 │  • Routes to _processReport() implementation                │
 └──────────────────────┬──────────────────────────────────────┘
                        │
-          ┌────────────┴────────────┐
-          ▼                         ▼
-    ┌──────────────┐         ┌──────────────┐
-    │ERC4626Multi  │         │Alternative   │
-    │Collateral    │         │1155Vault     │
-    │Vault (ERC20) │         │              │
-    │Share Tokens  │         │ERC1155 Share │
-    │              │         │TokenIds      │
-    └──────────────┘         └──────────────┘
-         │                        │
-         │ Holds                  │ Holds
-         ▼                        ▼
-    ┌──────────────────────────────────┐
-    │ ERC20 Collateral Tokens          │
-    │ (USDC, USDT, DAI, WETH, etc.)    │
-    └──────────────────────────────────┘
+          ┌────────────┴────────────┬────────────┐
+          ▼                         ▼            ▼
+    ┌──────────────┐         ┌──────────────┐ ┌──────────────┐
+    │     CSE20    │         │    CSE721    │ │   CSE1155    │
+    │   (ERC20)    │         │   (ERC721)   │ │  (ERC1155)   │
+    │Share Tokens  │         │Share Tokens  │ │Share Tokens  │
+    └──────────────┘         └──────────────┘ └──────────────┘
+         │                        │            │
+         └────────────────────────┼────────────┘
+                                  ▼
+                         ┌──────────────┐
+                         │   VaultCore  │
+                         │  (Asset      │
+                         │   Holder)    │
+                         └──────────────┘
+                              │
+                              ▼
+                         ┌──────────────────────────────────┐
+                         │ ERC20 Collateral Tokens          │
+                         │ (USDC, USDT, DAI, WETH, etc.)    │
+                         └──────────────────────────────────┘
 ```
 
 ### Contract Hierarchy
@@ -86,15 +95,23 @@ This project provides a **multi-collateral vault system** that enables:
                     ReceiverTemplate
                     (Abstract, Ownable)
                           ▲
-         ┌────────────────┴──────────────────┐
-         │                                   │
-    MultiCollateralVault              Alternative1155Vault
-    (ERC20, Ownable, ReceiverTemplate) (ReceiverTemplate)
-         │                                   │
-         ├─ _depositCollaterals()           ├─ _depositCollaterals()
-         ├─ _withdrawFromBatch()            ├─ _withdrawFromTokenId()
-         ├─ _processReport()                ├─ ERC1155Shares (nested)
-         └─ Events & State                  └─ Events & State
+         ┌────────────────┴──────────────────┬────────────────┐
+         │                                   │                │
+        CSE20                             CSE721           CSE1155
+    (ERC20, ReceiverTemplate)     (ReceiverTemplate)  (ReceiverTemplate)
+         │                                   │                │
+         ├─ _mintShares()                   ├─ _mintToken()   ├─ _mintBatch()
+         ├─ _withdrawShares()               ├─ _withdrawToken() ├─ _withdrawBatch()
+         ├─ _processReport()                ├─ _processReport() ├─ _processReport()
+         └─ Events & State                  └─ Events & State └─ Events & State
+                                   │
+                                   ▼
+                              VaultCore
+                           (Ownable, SafeERC20)
+                              │
+                              ├─ deposit()
+                              ├─ withdraw()
+                              └─ setAllowed()
 ```
 
 ---
@@ -137,102 +154,116 @@ Redeemed Amount per Collateral = (SharesToBurn / BatchTotalShares) × OriginalAm
 
 ## Contract Variants
 
-### MultiCollateralVault (ERC20 Shares)
+### VaultCore (Central Asset Holder)
 
-**File**: `src/dependencies/MultiCollateralVault.sol`
+**File**: `src/vaultcore/core.sol`
 
-- Inherits from `ERC20` (`OpenZeppelin`)
-- Single unified share token symbol
-- Shares are transferrable like any ERC20
-- Best for: Simple, traditional multi-asset pools
-
-**Constructor**:
-```solidity
-constructor(string memory _name, string memory _symbol, address _trustedForwarder)
-```
-
-**Key Methods**:
-- `_depositCollaterals(address user, address[] collaterals, uint256[] amounts, uint256 sharesToMint)`
-- `_withdrawFromBatch(address user, uint256 batchId, uint256 sharesToBurn, address receiver)`
-- `getBatchDetails(uint256 batchId)` - View original deposit composition
-- `getUserBatches(address user)` - Get all batch IDs for a user
-
----
-
-### Alternative1155Vault (ERC1155 Shares)
-
-**File**: `src/dependencies/alternative1155.sol`
-
-- Shares are **ERC1155 token IDs**, each mapped to a deposit batch
-- Includes nested `ERC1155Shares` contract (owned by vault)
-- Best for: NFT-like share ownership, batch-specific tracking
+- Central contract that holds all ERC20 collateral assets
+- Uses permissioned access control via `allowed` mapping
+- Only allowed contracts can deposit/withdraw assets
+- Best for: Centralized asset management and security
 
 **Constructor**:
 ```solidity
-constructor(string memory _uri, address _trustedForwarder)
+constructor()
 ```
 
 **Key Methods**:
-- `_depositCollaterals(address user, address[] collaterals, uint256[] amounts, uint256 sharesToMint)`
-- `_withdrawFromTokenId(address user, uint256 tokenId, uint256 sharesToBurn, address receiver)`
-- `shareToken` - Public reference to the `ERC1155Shares` contract
+- `setAllowed(address vault, bool status)` - Grant/revoke vault permissions (owner only)
+- `deposit(address from, address token, uint amount)` - Transfer tokens from user to vault
+- `withdraw(address to, address token, uint amount)` - Transfer tokens from vault to user
 
 ---
 
-### TokenizerFactory (Multi-Vault ERC20 Shares Factory)
+### CSE20 (ERC20 Share Tokenization)
 
-**File**: `src/dependencies/TokenizerFactory.sol`
+**File**: `src/CSE20.sol`
 
-- **Factory Pattern**: Users deploy multiple independent collateralized ERC20 vaults
-- Each vault has its own `CollateralBase` share token and custom collateral pools
-- Uses **action codes (uint8)** to determine CRE operations
-- Best for: Decentralized share creation, multi-pool management
+- Issues ERC20 share tokens for multi-collateral deposits
+- Supports multiple independent tokenizers (vaults) per deployer
+- Each tokenizer has its own share token and collateral configuration
+- Best for: Traditional fungible share tokens
 
 **Constructor**:
 ```solidity
-constructor(address _trustedForwarder)
+constructor(address _trustedForwarder, address _core)
 ```
-
-**Key Features**:
-- Users deploy their own share tokens with custom collaterals
-- Action codes (uint8):
-  - `0`: Mint Shares (create new batch deposit)
-  - `1`: Deposit Existing (add collateral to existing batch)
-  - `2`: Redeem Shares (burn shares and withdraw collateral)
-- Batch-based tracking with immutable redemption ratios
-- CRE fully controls all operations
 
 **Key Methods**:
-- `deployTokenizer(string name, string symbol, address[] collaterals)` - Deploy new vault
-- `addCollateral(uint256 vaultId, address collateral)` - Add supported collateral
-- `_mintShares(uint256 vaultId, address user, address[] collaterals, uint256[] amounts, uint256 sharesToMint)` - Create new batch
-- `_depositToExisting(uint256 vaultId, uint256 batchId, address user, address[] collaterals, uint256[] amounts, uint256 sharesToMint)` - Add to existing batch
-- `_redeemShares(uint256 vaultId, uint256 batchId, address user, uint256 sharesToBurn, address receiver)` - Burn and withdraw
-- `getBatchDetails(uint256 vaultId, uint256 batchId)` - View batch composition
-- `previewRedemption(uint256 vaultId, uint256 batchId, uint256 sharesToBurn)` - Preview collateral return
-- `getUserTokenizers(address user)` - Get user's deployed vaults
-
-**CRE Report Format**:
-
-#### Mint Shares (Action Code 0)
-```solidity
-// Create new batch and mint shares
-abi.encode(uint256 vaultId, uint8(0), address user, address[] collaterals, uint256[] amounts, uint256 sharesToMint)
-```
-
-#### Deposit Existing (Action Code 1)
-```solidity
-// Deposit to existing batch maintaining original ratio
-abi.encode(uint256 vaultId, uint8(1), uint256 batchId, address user, address[] collaterals, uint256[] amounts, uint256 sharesToMint)
-```
-
-#### Redeem Shares (Action Code 2)
-```solidity
-// Burn shares and withdraw collateral
-abi.encode(uint256 vaultId, uint8(2), uint256 batchId, address user, uint256 sharesToBurn, address receiver)
-```
+- `deployTokenizer(string name, string symbol, address[] collaterals)` - Create new ERC20 share token
+- `setCollaterals(uint256 vaultId, address[] collaterals)` - Update supported collaterals
+- `getVaultInfo(uint256 vaultId)` - View vault details
+- `getUserTokenizerIds(address user)` - Get user's deployed vaults
 
 ---
+
+### CSE721 (ERC721 Share Tokenization)
+
+**File**: `src/CSE721.sol`
+
+- Issues unique ERC721 tokens for each deposit batch
+- Each token represents a specific collateral deposit
+- Immutable redemption ratios locked per token
+- Best for: NFT-like share ownership
+
+**Constructor**:
+```solidity
+constructor(address _trustedForwarder, address _core, string memory _name, string memory _symbol)
+```
+
+**Key Methods**:
+- `getDepositToken(uint256 tokenId)` - View deposit details for a token
+- `_mintToken(address user, address[] collaterals, uint256[] amounts)` - Internal mint function
+- `_withdrawToken(address user, uint256 tokenId, address receiver)` - Internal withdrawal function
+
+---
+
+### CSE1155 (ERC1155 Share Tokenization)
+
+**File**: `src/CSE1155.sol`
+
+- Issues ERC1155 tokens for batch-based share management
+- Semi-fungible tokens with batch-specific tracking
+- Supports multiple shares per token ID
+- Best for: Batch-aware share management
+
+**Constructor**:
+```solidity
+constructor(address _trustedForwarder, address _core, string memory _uri)
+```
+
+**Key Methods**:
+- `getBatch(uint256 tokenId)` - View batch details
+- `_mintBatch(address user, address[] collaterals, uint256[] amounts, uint256 sharesToMint)` - Internal mint function
+- `_withdrawBatch(address user, uint256 tokenId, uint256 sharesToBurn)` - Internal withdrawal function
+
+---
+
+## Deployment
+
+The repository includes a deployment script that deploys all contracts and sets up permissions:
+
+**Script**: `script/Deploy.s.sol`
+
+**Environment Variables** (via `.env`):
+- `TRUSTED_FORWARD` - Chainlink forwarder address
+- `PRIVATE_KEY` - Deployer private key
+- `CSE721_NAME` - ERC721 token name (optional)
+- `CSE721_SYMBOL` - ERC721 token symbol (optional)
+- `CSE1155_URI` - ERC1155 metadata URI (optional)
+
+**Run Deployment**:
+```bash
+source .env
+forge script script/Deploy.s.sol --broadcast --rpc-url $RPC_URL --private-key $PRIVATE_KEY
+```
+
+The script deploys:
+1. `VaultCore` - Central asset holder
+2. `CSE20` - ERC20 tokenization
+3. `CSE721` - ERC721 tokenization  
+4. `CSE1155` - ERC1155 tokenization
+5. Sets `VaultCore.setAllowed()` for all CSE contracts
 
 ## Deposit Flow
 
@@ -716,20 +747,26 @@ forge test -vv
 ```
 chainlink_cre_unified_shares/
 ├── src/
-│   ├── Vault.sol                      # Main entry point
+│   ├── CSE20.sol                      # ERC20 share tokenization
+│   ├── CSE721.sol                     # ERC721 share tokenization
+│   ├── CSE1155.sol                    # ERC1155 share tokenization
+│   ├── vaultcore/
+│   │   └── core.sol                   # Central asset holder
 │   ├── dependencies/
-│   │   ├── MultiCollateralVault.sol   # ERC20-based shares
-│   │   ├── Alternative1155Vault.sol   # ERC1155-based shares
-│   │   ├── Receiver.sol               # CRE report receiver
-│   │   ├── Receiver.sol               # User helper contract
-│   │   └── MultiCollateralVaultAlt.sol # Alternative implementation
-│   └── interfaces/
-│       └── IReceiver.sol               # CRE receiver interface
+│   │   ├── Receiver.sol               # CRE report receiver template
+│   │   └── IReceiver.sol              # CRE receiver interface
+│   └── rwa/
+│       ├── uRWA20.sol                 # ERC20 RWA token implementation
+│       ├── uRWA721.sol                # ERC721 RWA token implementation
+│       └── uRWA1155.sol               # ERC1155 RWA token implementation
+├── script/
+│   └── Deploy.s.sol                   # Deployment script
 ├── lib/
 │   ├── forge-std/                     # Foundry standard library
 │   └── openzeppelin-contracts/        # OpenZeppelin Contracts
 ├── test/                              # Test files (if any)
 ├── foundry.toml                       # Foundry configuration
+├── .env.example                       # Environment variables template
 └── README.md                          # This file
 ```
 
@@ -737,168 +774,198 @@ chainlink_cre_unified_shares/
 
 ## Usage Guide
 
-### 1. Deploy a MultiCollateralVault (ERC20 Shares)
+### Environment Setup
 
-```solidity
-pragma solidity ^0.8.20;
-import {MultiCollateralVault} from "./src/dependencies/MultiCollateralVault.sol";
+1. **Copy environment template:**
+   ```bash
+   cp .env.example .env
+   ```
 
-contract MyVault is MultiCollateralVault {
-    constructor(address _trustedForwarder)
-        MultiCollateralVault("Unified Share", "USHARE", _trustedForwarder)
-    {}
-}
-```
+2. **Configure `.env` file:**
+   ```bash
+   # Required
+   TRUSTED_FORWARD=0xYourChainlinkForwarderAddress
+   PRIVATE_KEY=0xYourDeployerPrivateKey
+   
+   # Optional (defaults provided)
+   CSE721_NAME=CSE721 Share Token
+   CSE721_SYMBOL=CSE721
+   CSE1155_URI=https://example.com/metadata/{id}.json
+   
+   # Network
+   RPC_URL=https://rpc.sepolia.org
+   ```
 
-**Deployment:**
+### Deployment
+
+**Deploy all contracts using the script:**
 ```bash
-forge create src/MyVault.sol:MyVault \
-  --constructor-args 0xChainlinkForwarderAddress \
-  --rpc-url $RPC_URL \
-  --private-key $PRIVATE_KEY
+source .env
+forge script script/Deploy.s.sol --broadcast --rpc-url $RPC_URL --private-key $PRIVATE_KEY --verify
 ```
 
-### 2. Deploy an Alternative1155Vault (ERC1155 Shares)
+**Expected output:**
+```
+VaultCore: 0x...
+CSE20: 0x...
+CSE721: 0x...
+CSE1155: 0x...
+```
 
+### Post-Deployment Setup
+
+After deployment, the contracts are automatically configured:
+- `VaultCore` permissions are set for all CSE contracts
+- CSE contracts reference the deployed `VaultCore`
+- Ready for Chainlink CRE integration
+
+### Contract Interaction Examples
+
+#### CSE20 (ERC20 Shares)
 ```solidity
-pragma solidity ^0.8.20;
-import {Alternative1155Vault} from "./src/dependencies/alternative1155.sol";
+// Deploy a new ERC20 share token
+CSE20 cse20 = CSE20(deployedCSE20Address);
+uint256 vaultId = cse20.deployTokenizer("MyShares", "MSHARE", [usdcAddress, wethAddress]);
+```
 
-contract MyNFTVault is Alternative1155Vault {
-    constructor(address _trustedForwarder)
-        Alternative1155Vault("https://api.example.com/metadata/", _trustedForwarder)
+#### CSE721 (ERC721 Shares)  
+```solidity
+// Mint an ERC721 share token
+CSE721 cse721 = CSE721(deployedCSE721Address);
+// Call via CRE or directly for testing
+```
+
+#### CSE1155 (ERC1155 Shares)
+```solidity
+// Mint ERC1155 share tokens
+CSE1155 cse1155 = CSE1155(deployedCSE1155Address);
+// Call via CRE or directly for testing
+```
     {}
 }
 ```
 
 ### 3. Configure Vault
 
-```solidity
-// As owner (typically CRE operator)
+### Chainlink CRE Integration
 
-// Add supported collateral tokens
-vault.addCollateral(IERC20(0xUSDC));
-vault.addCollateral(IERC20(0xWETH));
-vault.addCollateral(IERC20(0xDAI));
+The CSE contracts are designed to work with Chainlink Runtime Environment (CRE) for automated deposit and withdrawal operations:
 
-// Configure Chainlink CRE validation
-vault.setExpectedAuthor(0xCREOperatorAddress);
-vault.setExpectedWorkflowId(0xYourWorkflowId);
-```
+1. **User submits deposit request** to CRE workflow
+2. **CRE validates and aggregates** reports from multiple oracles  
+3. **CRE calls contract methods** via `_processReport()` with signed data
+4. **Contract processes** deposit/withdrawal and mints/burns shares
 
-### 4. User Deposits (Off-Chain)
-
-```javascript
-// User-side (e.g., smart contract or DApp)
-
-const deposit = {
-  user: "0xUserAddress",
-  collaterals: ["0xUSDC", "0xWETH", "0xDAI"],
-  amounts: ["1000e6", "10e18", "500e18"],
-  sharesToMint: "100e18"
-};
-
-// Send to Chainlink CRE workflow
-// CRE will aggregate reports and trigger vault._processReport()
-```
-
-### 5. Query Vault State
+### Example CRE Report Processing
 
 ```solidity
-// View user's batches
-uint256[] memory batchIds = vault.getUserBatches(userAddress);
+// CRE report format (simplified)
+bytes memory report = abi.encode(
+    uint8 actionCode,      // 1=deposit, 2=withdraw, etc.
+    address user,
+    address[] collaterals,
+    uint256[] amounts,
+    uint256 shares
+);
 
-// Get batch details
-(
-  address[] memory collaterals,
-  uint256[] memory amounts,
-  uint256 shares,
-  uint256 timestamp,
-  address depositor
-) = vault.getBatchDetails(batchId);
-
-// Preview redemption
-(
-  address[] memory redeemCollaterals,
-  uint256[] memory redeemAmounts
-) = vault.previewBatchRedemption(batchId, sharesToBurn);
-
-// Check collateral balance
-uint256 usdcBalance = vault.getCollateralBalance(USDC);
+// Contract processes via CRE forwarder
+cseContract.processReport(report);
 ```
 
 ---
 
 ## API Reference
 
-### MultiCollateralVault
+## API Reference
+
+### VaultCore
 
 #### State Variables
 
 | Name | Type | Visibility | Description |
 |------|------|------------|-------------|
-| `collateralBalance` | `mapping(address => uint256)` | public | Total held per collateral token |
-| `depositBatches` | `mapping(uint256 => DepositBatch)` | public | Batch storage by ID |
-| `batchCounter` | `uint256` | public | Next batch ID |
-| `userBatches` | `mapping(address => uint256[])` | public | Batches per user |
-| `totalSharesIssued` | `uint256` | public | Cumulative shares minted |
-| `supportedCollaterals` | `IERC20[]` | public | List of allowed tokens |
+| `allowed` | `mapping(address => bool)` | public | Permissioned contracts that can deposit/withdraw |
 
 #### Functions
 
-##### `addCollateral(IERC20 _token)`
-- **Access**: `onlyOwner`
-- **Purpose**: Register new collateral token
-- **Emits**: `CollateralAdded`
+##### `setAllowed(address vault, bool status)`
+- **Access**: `external onlyOwner`
+- **Purpose**: Grant/revoke deposit/withdraw permissions
 
-##### `_depositCollaterals(address user, address[] collaterals, uint256[] amounts, uint256 sharesToMint)`
-- **Access**: `internal virtual`
-- **Purpose**: Process deposit (called by CRE)
-- **Returns**: `batchId`
+##### `deposit(address from, address token, uint amount)`
+- **Access**: `external onlyAllowed`
+- **Purpose**: Transfer ERC20 tokens from user to vault
 
-##### `_withdrawFromBatch(address user, uint256 batchId, uint256 sharesToBurn, address receiver)`
-- **Access**: `internal virtual`
-- **Purpose**: Process withdrawal (called by CRE)
-- **Returns**: `(collaterals, amounts)`
-
-##### `getBatchDetails(uint256 batchId)`
-- **Access**: `public view`
-- **Returns**: `(collaterals[], amounts[], shares, timestamp, depositor)`
-
-##### `getUserBatches(address user)`
-- **Access**: `public view`
-- **Returns**: `batchId[]`
-
-##### `previewBatchRedemption(uint256 batchId, uint256 sharesToBurn)`
-- **Access**: `public view`
-- **Returns**: `(collaterals[], amounts[])`
-
-##### `_validateDeposit(address[] collaterals, uint256[] amounts, uint256 sharesToMint)`
-- **Access**: `internal view virtual`
-- **Purpose**: Override for custom deposit validation
-
-##### `_validateWithdrawal(address user, uint256 batchId, uint256 sharesToBurn)`
-- **Access**: `internal view virtual`
-- **Purpose**: Override for custom withdrawal validation
+##### `withdraw(address to, address token, uint amount)`
+- **Access**: `external onlyAllowed`
+- **Purpose**: Transfer ERC20 tokens from vault to user
 
 ---
 
-### Alternative1155Vault
-
-Same as MultiCollateralVault, with these differences:
+### CSE20 (ERC20 Shares)
 
 #### State Variables
 
 | Name | Type | Visibility | Description |
 |------|------|------------|-------------|
-| `shareToken` | `ERC1155Shares` | public | ERC1155 share token contract |
+| `core` | `VaultCore` | public | Reference to asset holder |
+| `tokenizers` | `mapping(uint256 => TokenizerVault)` | public | Vault configurations |
+| `tokenizerId` | `uint256` | public | Next vault ID counter |
 
 #### Functions
 
-Identical to `MultiCollateralVault`, except:
-- Batches identified by **tokenId** instead of `batchId`
-- Share operations use `shareToken.mint()` / `burn()` / `balanceOf()`
-- Method names: `_withdrawFromTokenId()` instead of `_withdrawFromBatch()`
+##### `deployTokenizer(string name, string symbol, address[] collaterals)`
+- **Access**: `public`
+- **Returns**: `vaultId`
+- **Purpose**: Create new ERC20 share token vault
+
+##### `setCollaterals(uint256 vaultId, address[] collaterals)`
+- **Access**: `public` (vault deployer only)
+- **Purpose**: Update supported collateral tokens
+
+##### `getVaultInfo(uint256 vaultId)`
+- **Access**: `public view`
+- **Returns**: `(shareToken, deployer, collaterals[], totalShares, isActive)`
+
+##### `getUserTokenizerIds(address user)`
+- **Access**: `public view`
+- **Returns**: `vaultId[]`
+
+---
+
+### CSE721 (ERC721 Shares)
+
+#### State Variables
+
+| Name | Type | Visibility | Description |
+|------|------|------------|-------------|
+| `core` | `VaultCore` | public | Reference to asset holder |
+| `rwaToken` | `uRWA721` | public | ERC721 token contract |
+| `depositTokens` | `mapping(uint256 => DepositToken721)` | public | Token deposit data |
+
+#### Functions
+
+##### `getDepositToken(uint256 tokenId)`
+- **Access**: `public view`
+- **Returns**: `DepositToken721 struct`
+
+---
+
+### CSE1155 (ERC1155 Shares)
+
+#### State Variables
+
+| Name | Type | Visibility | Description |
+|------|------|------------|-------------|
+| `core` | `VaultCore` | public | Reference to asset holder |
+| `rwaToken` | `uRWA1155Metadata` | public | ERC1155 token contract |
+| `depositBatches` | `mapping(uint256 => DepositBatch1155)` | internal | Batch deposit data |
+
+#### Functions
+
+##### `getBatch(uint256 tokenId)`
+- **Access**: `public view`
+- **Returns**: `DepositBatch1155 struct`
 
 ---
 
